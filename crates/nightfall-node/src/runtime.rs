@@ -2661,10 +2661,9 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         if batch.is_empty() {
             break;
         }
-        let next_from = batch
-            .last()
-            .map(|b| b.header.height.0 + 1)
-            .unwrap_or(from + 1);
+        // Block heights came from the peer. `u64::MAX` has no successor;
+        // stop this sync round instead of overflowing height arithmetic.
+        let next_from = batch.last().and_then(|b| b.header.height.0.checked_add(1));
 
         let mut g = state.lock().unwrap();
         let applied = g.chain.try_ingest_blocks(batch, now_unix()).unwrap_or(0);
@@ -2672,6 +2671,9 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             total_applied += applied;
             g.bump_tip();
             let _ = g.persist();
+            let Some(next_from) = next_from else {
+                break;
+            };
             from = next_from;
             continue;
         }
