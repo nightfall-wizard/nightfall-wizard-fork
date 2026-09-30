@@ -183,7 +183,7 @@ pub struct NodeInner {
     /// do not connect to our tip — so we pull their chain on a fresh
     /// socket. Without a throttle, every 4-second Status tick would
     /// start the same download.
-    pub last_reorg_fetch: AtomicU64,
+    pub last_reorg_fetch: HashMap<String, u64>,
     /// Last time a 1-second ticker stored the wall clock. A jump larger than
     /// [`SLEEP_GAP_SECS`] means the process was frozen (lid closed). Mining
     /// must not resume on the stale tip.
@@ -769,7 +769,7 @@ impl NodeHandle {
             ibd_from: 0,
             ibd_buffer: BTreeMap::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
-            last_reorg_fetch: AtomicU64::new(0),
+            last_reorg_fetch: HashMap::new(),
             last_wall_tick: AtomicU64::new(now_unix()),
             confirmed_peers: HashSet::new(),
             stalled_on_fork: AtomicBool::new(false),
@@ -1552,6 +1552,24 @@ fn apply_ibd_page(inner: &mut NodeInner, blocks: Vec<Block>, now: u64) -> IbdPag
 
 const REORG_FETCH_COOLDOWN_SECS: u64 = 15;
 
+/// Claim the side-channel reorg-fetch slot for one peer.
+///
+/// The throttle is deliberately peer-scoped. A broken or slow peer must not
+/// suppress an independent peer that may have the heavier valid branch.
+///
+/// Expired entries are discarded so arbitrary peer addresses cannot make this
+/// map grow without bound.
+fn claim_reorg_fetch_slot(last_by_peer: &mut HashMap<String, u64>, addr: &str, now: u64) -> bool {
+    last_by_peer.retain(|_, last| now.saturating_sub(*last) < REORG_FETCH_COOLDOWN_SECS);
+
+    if last_by_peer.contains_key(addr) {
+        return false;
+    }
+
+    last_by_peer.insert(addr.to_string(), now);
+    true
+}
+
 /// Pull a peer's chain on a fresh socket and weigh it. Used when live
 /// `GetBlocks` cannot extend our tip — we are on a fork, not merely late.
 fn kick_reorg_fetch(state: &SharedState, sess: &SessionHandle) {
@@ -1568,12 +1586,10 @@ fn kick_reorg_fetch(state: &SharedState, sess: &SessionHandle) {
     }
     let now = now_unix();
     {
-        let Ok(g) = state.lock() else { return };
-        let last = g.last_reorg_fetch.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < REORG_FETCH_COOLDOWN_SECS {
+        let Ok(mut g) = state.lock() else { return };
+        if !claim_reorg_fetch_slot(&mut g.last_reorg_fetch, &addr, now) {
             return;
         }
-        g.last_reorg_fetch.store(now, Ordering::Relaxed);
     }
     tracing::info!("peer {addr} is ahead on a fork — fetching their chain");
     let st = Arc::clone(state);
@@ -3229,5 +3245,41 @@ mod sync_hold_tests {
         assert_eq!(hold, SyncHold::DeadBranch { gap: 5_976 });
         let hold = classify_sync_hold(true, false, 800, 17_000, 17_100, Some(1));
         assert_eq!(hold, SyncHold::DeadBranch { gap: 800 });
+    }
+}
+
+#[cfg(test)]
+mod reorg_fetch_throttle_tests {
+    use super::{claim_reorg_fetch_slot, REORG_FETCH_COOLDOWN_SECS};
+    use std::collections::HashMap;
+
+    #[test]
+    fn failed_peer_does_not_suppress_different_reorg_peer() {
+        let mut slots = HashMap::new();
+        let now = 1_000;
+
+        assert!(claim_reorg_fetch_slot(&mut slots, "127.0.0.1:10001", now));
+
+        // Repeated work from the same peer is throttled.
+        assert!(!claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:10001",
+            now + 1
+        ));
+
+        // Critical regression check: the first peer must not consume a
+        // node-global slot and suppress an independent candidate peer.
+        assert!(claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:10002",
+            now + 1
+        ));
+
+        // Once the cooldown expires, the original peer may be tried again.
+        assert!(claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:10001",
+            now + REORG_FETCH_COOLDOWN_SECS
+        ));
     }
 }
