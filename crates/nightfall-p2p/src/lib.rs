@@ -224,10 +224,125 @@ pub enum PeerMsg {
     },
 }
 
+/// JSON payload budget. `read_msg` counts the trailing newline against
+/// `MAX_MESSAGE_BYTES`, so the serialized JSON itself gets one byte less.
+const MAX_WIRE_PAYLOAD_BYTES: usize = MAX_MESSAGE_BYTES - 1;
+
+/// Serialization sink that refuses to grow past the wire limit.
+///
+/// This matters on the sending side too: serializing an oversized peer message
+/// into an ordinary `String` first defeats the receive-side allocation bound.
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(4096.min(limit)),
+            limit,
+        }
+    }
+}
+
+impl std::io::Write for BoundedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self.bytes.len().checked_add(buf.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer message size overflow",
+            )
+        })?;
+
+        if next > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("peer message exceeds {MAX_MESSAGE_BYTES} bytes"),
+            ));
+        }
+
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_wire_line<T: Serialize + ?Sized>(value: &T) -> std::io::Result<Vec<u8>> {
+    let mut out = BoundedBuffer::new(MAX_WIRE_PAYLOAD_BYTES);
+    serde_json::to_writer(&mut out, value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    out.bytes.push(b'\n');
+    Ok(out.bytes)
+}
+
+fn fits_wire<T: Serialize + ?Sized>(value: &T) -> bool {
+    let mut out = BoundedBuffer::new(MAX_WIRE_PAYLOAD_BYTES);
+    serde_json::to_writer(&mut out, value).is_ok()
+}
+
+/// Borrowed representation of the `Blocks` wire message, avoiding clones while
+/// measuring candidate prefixes.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BorrowedPeerMsg<'a> {
+    Blocks { blocks: &'a [Block] },
+}
+
+fn largest_fitting_prefix<F>(len: usize, mut fits: F) -> usize
+where
+    F: FnMut(usize) -> bool,
+{
+    let mut low = 0usize;
+    let mut high = len;
+
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    low
+}
+
+/// Trim a `Blocks` response to the largest prefix that can be represented as
+/// one legal P2P frame.
+///
+/// Returning an empty batch for a non-empty input would falsely mean "chain
+/// ends here", so a single unrepresentable block is an explicit error instead.
+pub fn fit_blocks_response(mut blocks: Vec<Block>) -> std::io::Result<Vec<Block>> {
+    if blocks.is_empty() {
+        return Ok(blocks);
+    }
+
+    let keep = largest_fitting_prefix(blocks.len(), |n| {
+        fits_wire(&BorrowedPeerMsg::Blocks {
+            blocks: &blocks[..n],
+        })
+    });
+
+    if keep == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "single block exceeds the P2P message limit",
+        ));
+    }
+
+    blocks.truncate(keep);
+    Ok(blocks)
+}
+
 pub fn write_msg(stream: &mut TcpStream, msg: &PeerMsg) -> std::io::Result<()> {
-    let line = serde_json::to_string(msg).map_err(|e| std::io::Error::other(e.to_string()))?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
+    // Serialize completely inside the bounded buffer before touching the
+    // socket. An oversized message therefore cannot leave a partial frame.
+    let line = encode_wire_line(msg)?;
+    stream.write_all(&line)?;
     stream.flush()?;
     Ok(())
 }
@@ -433,16 +548,83 @@ pub fn request_blocks(
     from_height: u64,
     limit: usize,
 ) -> std::io::Result<Vec<Block>> {
-    write_msg(stream, &PeerMsg::GetBlocks { from_height, limit })?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    match read_msg(&mut reader)? {
-        PeerMsg::Blocks { blocks } => Ok(blocks),
-        PeerMsg::Error { message } => Err(std::io::Error::other(message)),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected blocks",
-        )),
+    let target = limit.min(MAX_BLOCKS_PER_REQUEST);
+    if target == 0 {
+        return Ok(Vec::new());
     }
+
+    let mut all = Vec::with_capacity(target);
+    let mut next_height = from_height;
+
+    while all.len() < target {
+        let remaining = target - all.len();
+
+        write_msg(
+            stream,
+            &PeerMsg::GetBlocks {
+                from_height: next_height,
+                limit: remaining,
+            },
+        )?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let batch = match read_msg(&mut reader)? {
+            PeerMsg::Blocks { blocks } => blocks,
+            PeerMsg::Error { message } => return Err(std::io::Error::other(message)),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "expected blocks",
+                ))
+            }
+        };
+
+        if batch.is_empty() {
+            break;
+        }
+
+        if batch.len() > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer returned more blocks than requested",
+            ));
+        }
+
+        // Pagination must never trust a peer-supplied last height to skip
+        // forward. Require exactly the range we requested.
+        for (offset, block) in batch.iter().enumerate() {
+            let expected = next_height.checked_add(offset as u64).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "block response height overflow",
+                )
+            })?;
+
+            if block.header.height.0 != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected block height {}, expected {expected}",
+                        block.header.height.0
+                    ),
+                ));
+            }
+        }
+
+        let received = batch.len();
+        all.extend(batch);
+
+        if all.len() >= target {
+            break;
+        }
+
+        let Some(height) = next_height.checked_add(received as u64) else {
+            break;
+        };
+        next_height = height;
+    }
+
+    Ok(all)
 }
 
 pub fn broadcast_block(stream: &mut TcpStream, block: &Block) -> std::io::Result<()> {
@@ -467,7 +649,7 @@ pub fn broadcast_tx(stream: &mut TcpStream, tx: &Transaction) -> std::io::Result
 
 #[cfg(test)]
 mod directory_tests {
-    use super::is_directory_addr;
+    use super::*;
 
     #[test]
     fn seeds_and_public_ips_are_publishable() {
@@ -485,5 +667,27 @@ mod directory_tests {
         assert!(!is_directory_addr("abcd.onion:17891"));
         assert!(!is_directory_addr("no-port"));
         assert!(!is_directory_addr(""));
+    }
+
+    #[test]
+    fn outbound_wire_encoding_rejects_oversized_messages() {
+        let msg = PeerMsg::Error {
+            message: "x".repeat(MAX_MESSAGE_BYTES),
+        };
+
+        let err = encode_wire_line(&msg).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fitting_prefix_search_returns_largest_valid_prefix() {
+        assert_eq!(largest_fitting_prefix(128, |n| n <= 37), 37);
+        assert_eq!(largest_fitting_prefix(128, |_| true), 128);
+        assert_eq!(largest_fitting_prefix(128, |_| false), 0);
+    }
+
+    #[test]
+    fn empty_blocks_response_remains_empty() {
+        assert!(fit_blocks_response(Vec::new()).unwrap().is_empty());
     }
 }
