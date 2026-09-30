@@ -1435,7 +1435,7 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     // that just opened Core is often tens of blocks behind; one GetBlocks
     // here, then the loop chains pages if the peer is still ahead. Claim a
     // unique slice so two new outbound peers do not fetch the same page.
-    if peer_h + 1 > next || peer_tip != tip.to_hex() {
+    if peer_covers_height(peer_h, next) || peer_tip != tip.to_hex() {
         let from_height = {
             let mut g = state.lock().unwrap();
             claim_ibd_from(&mut g)
@@ -1700,6 +1700,27 @@ fn fetch_directory_peers(url: &str, genesis_hex: &str) -> anyhow::Result<Vec<Str
         .filter(|a| is_directory_addr(a))
         .take(MAX_PEERS_PER_MSG)
         .collect())
+}
+
+/// Whether a peer's advertised tip includes `next_height`.
+///
+/// Peer heights come from the network and may be `u64::MAX`. Expressing
+/// this as `peer_height + 1 > next_height` can overflow; the equivalent
+/// comparison below cannot.
+fn peer_covers_height(peer_height: u64, next_height: u64) -> bool {
+    peer_height >= next_height
+}
+
+#[cfg(test)]
+mod peer_height_wire_tests {
+    use super::peer_covers_height;
+
+    #[test]
+    fn untrusted_max_height_cannot_overflow() {
+        assert!(peer_covers_height(u64::MAX, u64::MAX));
+        assert!(peer_covers_height(100, 100));
+        assert!(!peer_covers_height(99, 100));
+    }
 }
 
 fn finish_introduction(
@@ -2093,7 +2114,7 @@ fn peer_io_loop(
                     g.session_height.insert(sess.key.clone(), height);
                     let next = next_needed_height(&g);
                     let our_tip = g.chain.tip_hash().to_hex();
-                    let want = if height + 1 > next {
+                    let want = if peer_covers_height(height, next) {
                         Some(claim_ibd_from(&mut g))
                     } else {
                         None
@@ -2166,7 +2187,7 @@ fn peer_io_loop(
                 note_peer_height(state, height);
                 let want = {
                     let mut g = state.lock().unwrap();
-                    if height + 1 > next_needed_height(&g) {
+                    if peer_covers_height(height, next_needed_height(&g)) {
                         Some(claim_ibd_from(&mut g))
                     } else {
                         None
@@ -2200,7 +2221,7 @@ fn peer_io_loop(
                 let (want, reject) = {
                     let mut g = state.lock().unwrap();
                     let next = next_needed_height(&g);
-                    let behind = last_peer_height + 1 > next;
+                    let behind = peer_covers_height(last_peer_height, next);
                     match outcome {
                         IbdPage::Applied(_) | IbdPage::Buffered if behind => {
                             (Some(claim_ibd_from(&mut g)), false)
