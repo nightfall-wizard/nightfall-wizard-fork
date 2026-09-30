@@ -1143,3 +1143,25 @@ fn the_mempool_can_be_reconciled_against_the_chain() {
         "the timestamp index has to shrink with the map"
     );
 }
+
+#[test]
+fn bodies_through_handles_max_height_after_pruning() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+
+    for i in 0..3u64 {
+        chain
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    assert_eq!(chain.prune_keep(1).unwrap(), 2);
+    assert_eq!(chain.first_height, 2);
+
+    // A hostile/extreme height must not overflow `height + 1`.
+    assert!(chain.bodies_through(u64::MAX).is_none());
+
+    // Preserve the prune-boundary semantics.
+    assert_eq!(chain.bodies_through(1), Some(Vec::new()));
+    assert!(chain.bodies_through(0).is_none());
+}
