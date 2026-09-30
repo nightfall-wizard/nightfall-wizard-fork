@@ -2,9 +2,9 @@
 
 use nightfall_consensus::MAX_REORG_DEPTH;
 use nightfall_node::runtime::{
-    merge_directory_peers, mining_should_wait, outbound_dial_list, peers_to_remember,
-    pick_eviction_victim, reorg_fetch_cap, EvictionCandidate, IBD_BEHIND, MAX_CATCHUP_WAIT_SECS,
-    MAX_OUTBOUND_EXTRA, MAX_REORG_FETCH, PEER_HEIGHT_TTL_SECS,
+    merge_directory_peers, mining_should_wait, next_fetch_height, outbound_dial_list,
+    peers_to_remember, pick_eviction_victim, reorg_fetch_cap, EvictionCandidate, IBD_BEHIND,
+    MAX_CATCHUP_WAIT_SECS, MAX_OUTBOUND_EXTRA, MAX_REORG_FETCH, PEER_HEIGHT_TTL_SECS,
 };
 
 #[test]
@@ -36,8 +36,15 @@ fn a_peer_thousands_ahead_on_a_shallow_fork_is_still_fetched() {
 
 #[test]
 fn a_liar_advertising_u64_max_is_capped() {
-    let cap = reorg_fetch_cap(u64::MAX - 1, 0);
-    assert_eq!(cap, MAX_REORG_FETCH);
+    assert_eq!(reorg_fetch_cap(u64::MAX - 1, 0), MAX_REORG_FETCH);
+    assert_eq!(reorg_fetch_cap(u64::MAX, 0), MAX_REORG_FETCH);
+}
+
+#[test]
+fn fetch_height_stops_at_u64_max() {
+    assert_eq!(next_fetch_height(41), Some(42));
+    assert_eq!(next_fetch_height(u64::MAX - 1), Some(u64::MAX));
+    assert_eq!(next_fetch_height(u64::MAX), None);
 }
 
 #[test]

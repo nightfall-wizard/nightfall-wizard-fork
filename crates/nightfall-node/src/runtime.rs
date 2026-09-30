@@ -2805,8 +2805,18 @@ pub fn reorg_fetch_cap(peer_height: u64, from_height: u64) -> usize {
     if from_height > peer_height {
         return 0;
     }
-    let want = (peer_height - from_height) as usize + 1;
-    want.min(MAX_REORG_FETCH)
+    peer_height
+        .saturating_sub(from_height)
+        .saturating_add(1)
+        .min(MAX_REORG_FETCH as u64) as usize
+}
+
+/// Advance past a height supplied by an untrusted peer.
+///
+/// `u64::MAX` has no successor, so it terminates pagination instead of
+/// overflowing the node's height arithmetic.
+pub fn next_fetch_height(height: u64) -> Option<u64> {
+    height.checked_add(1)
 }
 
 /// Download blocks `[from_height ..= peer_height]` in pages.
@@ -2825,11 +2835,14 @@ fn fetch_blocks_from(
             break;
         }
         let n = batch.len();
-        from = batch
+        let next_from = batch
             .last()
-            .map(|b| b.header.height.0 + 1)
-            .unwrap_or(from + 1);
+            .and_then(|b| next_fetch_height(b.header.height.0));
         all.extend(batch);
+        let Some(next_from) = next_from else {
+            break;
+        };
+        from = next_from;
         if n < MAX_BLOCKS_PER_REQUEST || from > peer_height {
             break;
         }
