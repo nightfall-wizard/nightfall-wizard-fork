@@ -7,8 +7,8 @@
 **Fee:** 100% burn  
 **P2P default:** `0.0.0.0:17891`  
 **RPC default:** `127.0.0.1:17881` (local wallet only)  
-**Protocol:** v7 (Nightproof) · **Wire:** v4
-**Genesis:** `c8614333c0f86a4824df212474632f4b9feecf9bf0593841199d894127f2f9a6`
+**Protocol:** v8 (Nightproof) · **Wire:** v6
+**Genesis:** `061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de`
 
 > ⚠ **Every chain before v7 is dead.** v4 was consensus-broken — anyone could
 > mint unlimited NIGHT, see [`AUDIT-2026-08-12.md`](./AUDIT-2026-08-12.md). v5
