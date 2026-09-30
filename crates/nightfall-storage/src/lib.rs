@@ -79,6 +79,32 @@ fn json_format_name() -> String {
     "json".to_string()
 }
 
+/// Make a completed rename durable where the platform supports directory
+/// syncing. File contents are synced separately before the rename.
+fn sync_parent_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        File::open(parent)?.sync_all()?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+/// Finish a buffered file before it becomes authoritative on disk.
+fn flush_and_sync(file: &mut BufWriter<File>) -> anyhow::Result<()> {
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    Ok(())
+}
+
 pub struct ChainStore {
     pub dir: PathBuf,
 }
@@ -185,8 +211,14 @@ impl ChainStore {
             validated_headers_bytes,
         };
         let tmp = self.dir.join("chain-meta.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
-        fs::rename(tmp, self.meta_path())?;
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec_pretty(&meta)?)?;
+            file.sync_all()?;
+        }
+        let dst = self.meta_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -504,7 +536,7 @@ impl ChainStore {
         for block in &chain.blocks[on_disk as usize..] {
             codec::write_block(&mut file, block, fmt)?;
         }
-        file.flush()?;
+        flush_and_sync(&mut file)?;
         self.write_meta(chain)?;
         Ok(())
     }
@@ -545,7 +577,7 @@ impl ChainStore {
             for block in chain.blocks.iter().skip(already) {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
 
         self.write_meta(chain)?;
@@ -560,9 +592,11 @@ impl ChainStore {
                 serde_json::to_writer(&mut file, h)?;
                 file.write_all(b"\n")?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
-        fs::rename(tmp, self.headers_path())?;
+        let dst = self.headers_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -571,8 +605,14 @@ impl ChainStore {
             anyhow::bail!("pruned chain is missing its UTXO horizon");
         };
         let tmp = self.dir.join("utxo-horizon.json.tmp");
-        fs::write(&tmp, serde_json::to_vec(&horizon_to_file(horizon))?)?;
-        fs::rename(tmp, self.horizon_path())?;
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec(&horizon_to_file(horizon))?)?;
+            file.sync_all()?;
+        }
+        let dst = self.horizon_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -584,9 +624,11 @@ impl ChainStore {
             for block in &chain.blocks {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
-        fs::rename(tmp, self.blocks_path())?;
+        let dst = self.blocks_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -605,9 +647,11 @@ impl ChainStore {
             for block in &chain.blocks {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
-        fs::rename(tmp, self.blocks_path())?;
+        let dst = self.blocks_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         self.write_meta(chain)?;
         Ok(())
     }
