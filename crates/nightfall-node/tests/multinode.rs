@@ -562,3 +562,295 @@ fn three_real_nodes_form_a_devnet_cluster() {
     eprintln!("{}", b.dump());
     eprintln!("{}", c.dump());
 }
+
+#[test]
+fn removed_peers_stay_disconnected_until_readded() {
+    let a = TestNode::start("remove-peer-A", vec![]);
+    let b = TestNode::start("remove-peer-B", vec![]);
+
+    let a_addr = a.addr();
+    let b_addr = b.addr();
+
+    a.node
+        .add_peer(&b_addr)
+        .expect("add B as outbound peer of A");
+
+    wait_until(
+        "A and B establish the initial session",
+        PEER_TIMEOUT,
+        &[&a, &b],
+        || {
+            let sa = a.snapshot();
+            let sb = b.snapshot();
+            sa.live_peers >= 1 && sb.live_peers >= 1
+        },
+    );
+
+    // The inbound handshake advertises the caller's listen port, so each
+    // node can learn how to dial the other. Wait until that reverse path is
+    // visible before cutting it; otherwise this test would miss the exact
+    // rediscovery/redial race that remove_peer is meant to control.
+    wait_until(
+        "A and B learn each other's dialable addresses",
+        PEER_TIMEOUT,
+        &[&a, &b],
+        || a.node.peers().contains(&b_addr) && b.node.peers().contains(&a_addr),
+    );
+
+    assert!(
+        a.node
+            .remove_peer(&b_addr)
+            .expect("remove B from A's dial set"),
+        "A should report B as an existing peer"
+    );
+    assert!(
+        b.node
+            .remove_peer(&a_addr)
+            .expect("remove A from B's dial set"),
+        "B should report A as an existing peer"
+    );
+
+    wait_until(
+        "A and B disconnect after symmetric peer removal",
+        PEER_TIMEOUT,
+        &[&a, &b],
+        || {
+            let sa = a.snapshot();
+            let sb = b.snapshot();
+            sa.live_peers == 0 && sb.live_peers == 0
+        },
+    );
+
+    assert!(
+        !a.node.peers().contains(&b_addr),
+        "removed B still appears in A's dialable peer set"
+    );
+    assert!(
+        !b.node.peers().contains(&a_addr),
+        "removed A still appears in B's dialable peer set"
+    );
+
+    // The outbound supervisor scans every two seconds. Remaining isolated
+    // across multiple scans proves that neither learned/gossiped address
+    // silently resurrects the partitioned link.
+    let stable_until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < stable_until {
+        let sa = a.snapshot();
+        let sb = b.snapshot();
+
+        assert_eq!(
+            sa.live_peers,
+            0,
+            "A regained a session with B unexpectedly:\n{}",
+            a.dump()
+        );
+        assert_eq!(
+            sb.live_peers,
+            0,
+            "B regained a session with A unexpectedly:\n{}",
+            b.dump()
+        );
+
+        std::thread::sleep(POLL);
+    }
+
+    // Healing the partition is explicit on both sides.
+    a.node
+        .add_peer(&b_addr)
+        .expect("re-add B as outbound peer of A");
+    b.node
+        .add_peer(&a_addr)
+        .expect("re-add A as outbound peer of B");
+
+    wait_until(
+        "A and B reconnect after symmetric re-add",
+        PEER_TIMEOUT,
+        &[&a, &b],
+        || {
+            let sa = a.snapshot();
+            let sb = b.snapshot();
+            sa.live_peers >= 1 && sb.live_peers >= 1
+        },
+    );
+
+    assert!(
+        a.node.peers().contains(&b_addr),
+        "re-added B is missing from A's dialable peer set"
+    );
+    assert!(
+        b.node.peers().contains(&a_addr),
+        "re-added A is missing from B's dialable peer set"
+    );
+}
+
+#[test]
+fn three_nodes_converge_after_partition_with_competing_branches() {
+    let (short, heavy) = build_competing_devnet_chains();
+
+    let short_tip = short.tip_hash().to_hex();
+    let expected_tip = heavy.tip_hash().to_hex();
+    let expected_height = heavy.tip_height().map(|h| h.0).unwrap_or(0);
+    let expected_work = heavy.total_work;
+    let expected_root = heavy.ledger.utxo_root().to_hex();
+
+    // Partition 1: A and B begin on the same shorter branch.
+    let a = TestNode::start_with("partition-A", vec![], |dir| {
+        ChainStore::new(dir)
+            .save(&short)
+            .expect("persist A short branch");
+    });
+
+    let b = TestNode::start_with("partition-B", vec![], |dir| {
+        ChainStore::new(dir)
+            .save(&short)
+            .expect("persist B short branch");
+    });
+
+    // Partition 2: C begins independently on the heavier competing branch.
+    let c = TestNode::start_with("partition-C", vec![], |dir| {
+        ChainStore::new(dir)
+            .save(&heavy)
+            .expect("persist C heavy branch");
+    });
+
+    let a_addr = a.addr();
+    let b_addr = b.addr();
+    let c_addr = c.addr();
+
+    // Form the short-branch component while C remains completely isolated.
+    a.node
+        .add_peer(&b_addr)
+        .expect("connect A to B inside short partition");
+
+    wait_until(
+        "A and B form short partition while C remains isolated",
+        PEER_TIMEOUT,
+        &[&a, &b, &c],
+        || {
+            let sa = a.snapshot();
+            let sb = b.snapshot();
+            let sc = c.snapshot();
+
+            !sa.loading
+                && !sb.loading
+                && !sc.loading
+                && sa.tip == short_tip
+                && sb.tip == short_tip
+                && sc.tip == expected_tip
+                && sa.tip != sc.tip
+                && sb.tip != sc.tip
+                && sa.live_peers >= 1
+                && sb.live_peers >= 1
+                && sc.live_peers == 0
+                && sc.total_work > sa.total_work
+                && sc.total_work > sb.total_work
+        },
+    );
+
+    // Heal the partition explicitly from both components. This exercises
+    // real outbound sessions and leaves no dependency on gossip timing.
+    b.node
+        .add_peer(&c_addr)
+        .expect("connect short partition B to heavy partition C");
+    c.node
+        .add_peer(&a_addr)
+        .expect("connect heavy partition C to short partition A");
+
+    wait_until(
+        "all three nodes converge on heavier branch after partition heal",
+        Duration::from_secs(60),
+        &[&a, &b, &c],
+        || {
+            let sa = a.snapshot();
+            let sb = b.snapshot();
+            let sc = c.snapshot();
+
+            !sa.loading
+                && !sb.loading
+                && !sc.loading
+                && sa.tip == expected_tip
+                && sb.tip == expected_tip
+                && sc.tip == expected_tip
+                && sa.tip_height == expected_height
+                && sb.tip_height == expected_height
+                && sc.tip_height == expected_height
+                && sa.total_work == expected_work
+                && sb.total_work == expected_work
+                && sc.total_work == expected_work
+                && sa.utxo_root == expected_root
+                && sb.utxo_root == expected_root
+                && sc.utxo_root == expected_root
+                && sa.supply_ok
+                && sb.supply_ok
+                && sc.supply_ok
+                && !sa.stalled_on_fork
+                && !sb.stalled_on_fork
+                && !sc.stalled_on_fork
+                && !sa.reorg_in_flight
+                && !sb.reorg_in_flight
+                && !sc.reorg_in_flight
+                && matches!(sa.sync_hold, SyncHold::Synced)
+                && matches!(sb.sync_hold, SyncHold::Synced)
+                && matches!(sc.sync_hold, SyncHold::Synced)
+        },
+    );
+
+    let sa = a.snapshot();
+    let sb = b.snapshot();
+    let sc = c.snapshot();
+
+    // Consensus identity.
+    for (name, s) in [("A", &sa), ("B", &sb), ("C", &sc)] {
+        assert_eq!(s.tip, expected_tip, "{name} has wrong final tip");
+        assert_eq!(
+            s.tip_height, expected_height,
+            "{name} has wrong final height"
+        );
+        assert_eq!(
+            s.total_work, expected_work,
+            "{name} has wrong cumulative work"
+        );
+        assert_eq!(
+            s.utxo_root, expected_root,
+            "{name} has wrong final UTXO root"
+        );
+        assert!(s.supply_ok, "{name} violates supply invariant");
+        assert!(
+            !s.stalled_on_fork,
+            "{name} remained stalled after convergence"
+        );
+        assert!(!s.reorg_in_flight, "{name} still reports reorg in flight");
+        assert!(
+            matches!(s.sync_hold, SyncHold::Synced),
+            "{name} did not return to SyncHold::Synced"
+        );
+    }
+
+    // Full ledger-state identity, not merely matching block headers.
+    assert_eq!(sa.utxos, sb.utxos, "A/B UTXO count differs");
+    assert_eq!(sb.utxos, sc.utxos, "B/C UTXO count differs");
+
+    assert_eq!(sa.kernels, sb.kernels, "A/B kernel count differs");
+    assert_eq!(sb.kernels, sc.kernels, "B/C kernel count differs");
+
+    assert_eq!(sa.minted, sb.minted, "A/B minted supply differs");
+    assert_eq!(sb.minted, sc.minted, "B/C minted supply differs");
+
+    assert_eq!(
+        sa.burned_fees, sb.burned_fees,
+        "A/B burned-fee state differs"
+    );
+    assert_eq!(
+        sb.burned_fees, sc.burned_fees,
+        "B/C burned-fee state differs"
+    );
+
+    // Both nodes that began on the losing branch must actually have reorged.
+    assert_ne!(short_tip, sa.tip, "A never left the losing branch");
+    assert_ne!(short_tip, sb.tip, "B never left the losing branch");
+
+    eprintln!("THREE-NODE PARTITION/REORG CONVERGENCE OK");
+    eprintln!("{}", a.dump());
+    eprintln!("{}", b.dump());
+    eprintln!("{}", c.dump());
+}
