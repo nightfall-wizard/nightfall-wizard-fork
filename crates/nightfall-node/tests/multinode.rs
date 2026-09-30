@@ -439,8 +439,8 @@ fn real_nodes_reorg_to_heavier_devnet_branch() {
     }
 
     // Re-open A's store independently after the runtime reorg.
-    // This proves that the adopted canonical branch reached durable storage,
-    // rather than existing only in the node's in-memory state.
+    // This verifies that the adopted canonical branch was written to the
+    // persisted store, rather than existing only in the node's in-memory state.
     let persisted_a = ChainStore::new(a._dir.path())
         .load_or_new(NetworkId::Devnet)
         .expect("reload A chain from disk after P2P reorg");
