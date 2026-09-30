@@ -164,6 +164,35 @@ fn a_lighter_chain_is_declined_not_accused() {
 }
 
 #[test]
+fn reorg_depth_boundary_is_inclusive() {
+    // MAX_REORG_DEPTH is the largest permitted rewind. Only a rewind
+    // strictly beyond the bound may be rejected as ReorgTooDeep.
+    let miner = WalletKeys::generate().address();
+    let mut mined = devnet();
+    let template = mined.mine_block(&miner, vec![], NOW).unwrap();
+
+    let candidate = vec![template; MAX_REORG_DEPTH + 2];
+
+    let at_limit = vec![Hash256([0xA1; 32]); MAX_REORG_DEPTH];
+    assert_eq!(reorg_rewind(&at_limit, &candidate), MAX_REORG_DEPTH);
+
+    let verdict = Chain::evaluate_reorg(NetworkId::Devnet, 0, &at_limit, candidate.clone(), NOW);
+    assert!(
+        !matches!(verdict, Err(ConsensusError::ReorgTooDeep)),
+        "a rewind exactly at MAX_REORG_DEPTH must pass the depth bound, got {verdict:?}"
+    );
+
+    let past_limit = vec![Hash256([0xA1; 32]); MAX_REORG_DEPTH + 1];
+    assert_eq!(reorg_rewind(&past_limit, &candidate), MAX_REORG_DEPTH + 1);
+
+    let verdict = Chain::evaluate_reorg(NetworkId::Devnet, 0, &past_limit, candidate, NOW);
+    assert!(
+        matches!(verdict, Err(ConsensusError::ReorgTooDeep)),
+        "a rewind past MAX_REORG_DEPTH must be refused, got {verdict:?}"
+    );
+}
+
+#[test]
 fn reorg_depth_is_the_rewind_not_the_length() {
     // Depth is how many of *our* blocks we would drop. A peer that shares
     // nothing with a 501-block history is too deep even if it only sends a
