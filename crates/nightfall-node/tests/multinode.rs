@@ -438,6 +438,37 @@ fn real_nodes_reorg_to_heavier_devnet_branch() {
         );
     }
 
+    // Re-open A's store independently after the runtime reorg.
+    // This proves that the adopted canonical branch reached durable storage,
+    // rather than existing only in the node's in-memory state.
+    let persisted_a = ChainStore::new(a._dir.path())
+        .load_or_new(NetworkId::Devnet)
+        .expect("reload A chain from disk after P2P reorg");
+
+    assert_eq!(
+        persisted_a.tip_hash().to_hex(),
+        expected_tip,
+        "A persisted the wrong canonical tip after reorg"
+    );
+    assert_eq!(
+        persisted_a.tip_height().map(|h| h.0).unwrap_or(0),
+        expected_height,
+        "A persisted the wrong canonical height after reorg"
+    );
+    assert_eq!(
+        persisted_a.total_work, expected_work,
+        "A persisted the wrong total work after reorg"
+    );
+    assert_eq!(
+        persisted_a.ledger.utxo_root().to_hex(),
+        expected_root,
+        "A persisted the wrong UTXO root after reorg"
+    );
+
+    persisted_a
+        .verify_supply()
+        .expect("A persisted chain violates supply invariant after reorg");
+
     eprintln!("REAL P2P REORG OK");
     eprintln!("before A tip={}", before.tip);
     eprintln!("final  A {}", a.dump());
