@@ -72,3 +72,23 @@ unchanged.
 
 This still does not modify `LedgerState`, block validation, protocol version,
 genesis, emission, wallet ownership, or mainnet consensus.
+
+## Stage 3 — delta rollback journal
+
+The shadow transition no longer clones the complete authenticated tree before
+every block.
+
+Instead it records a minimal undo journal containing only UTXOs actually
+removed or created by the candidate shadow transition.
+
+If any post-transition invariant fails, journal entries are replayed in reverse
+order. Tests require rollback to restore:
+
+- the exact canonical leaf map,
+- the exact sparse-node map,
+- the exact authenticated root.
+
+The independent full rebuild remains enabled as a development oracle. It is
+not intended to remain mandatory in the production hot path.
+
+This remains experimental shadow infrastructure and is not consensus-active.

@@ -624,64 +624,126 @@ impl AuthenticatedUtxoTree {
     ) -> Result<ShadowTransitionReport, ShadowStateError> {
         let previous_root = self.root();
 
-        // Transactional staging:
-        // no mutation reaches `self` until every invariant succeeds.
-        let mut staged = self.clone();
+        // Transactional delta journal.
+        //
+        // Only UTXOs touched by this transition are recorded.
+        // The complete authenticated tree is no longer cloned.
+        let mut undo = Vec::<ShadowUndo>::with_capacity(spent.len() + created.len());
 
         for commitment in spent {
-            if staged.remove(commitment).is_none() {
+            let Some(previous) = self.remove(commitment) else {
+                rollback_shadow(self, &mut undo);
+
                 return Err(ShadowStateError::MissingSpentUtxo {
                     commitment: *commitment,
                 });
-            }
+            };
+
+            undo.push(ShadowUndo::Restore {
+                commitment: *commitment,
+                entry: previous,
+            });
         }
 
         for (commitment, entry) in created {
-            if staged.insert(*commitment, entry.clone()).is_some() {
+            if self.contains_key(commitment) {
+                rollback_shadow(self, &mut undo);
+
                 return Err(ShadowStateError::DuplicateCreatedUtxo {
                     commitment: *commitment,
                 });
             }
+
+            self.insert(*commitment, entry.clone());
+
+            undo.push(ShadowUndo::Remove {
+                commitment: *commitment,
+            });
         }
 
-        // Strongest possible shadow-mode comparison:
-        // compare every canonical key and every consensus-relevant field.
-        if staged.entries != canonical_after.entries {
-            return Err(ShadowStateError::CanonicalStateMismatch {
-                shadow_len: staged.entries.len(),
+        // Development shadow invariant:
+        // the complete authenticated leaf map must match
+        // Nightfall's already-accepted canonical UTXO state.
+        if self.entries != canonical_after.entries {
+            let error = ShadowStateError::CanonicalStateMismatch {
+                shadow_len: self.entries.len(),
                 canonical_len: canonical_after.entries.len(),
-                first_mismatch: first_mismatch_key(&staged.entries, &canonical_after.entries),
-            });
+                first_mismatch: first_mismatch_key(&self.entries, &canonical_after.entries),
+            };
+
+            rollback_shadow(self, &mut undo);
+
+            return Err(error);
         }
 
         // Independent reconstruction oracle.
         //
-        // This is intentionally slower.  Shadow mode is for proving the
-        // incremental algorithm before it ever becomes consensus-critical.
+        // This remains deliberately expensive during
+        // development. Before production integration it
+        // will become a periodic deep audit rather than
+        // a per-block hot-path operation.
         let rebuilt = AuthenticatedUtxoTree::from_utxo_set(canonical_after);
 
-        let incremental_root = staged.root();
+        let incremental_root = self.root();
+
         let rebuilt_root = rebuilt.root();
 
         if incremental_root != rebuilt_root {
-            return Err(ShadowStateError::RebuildRootMismatch {
+            let error = ShadowStateError::RebuildRootMismatch {
                 incremental: incremental_root,
                 rebuilt: rebuilt_root,
-            });
+            };
+
+            rollback_shadow(self, &mut undo);
+
+            return Err(error);
         }
 
-        let report = ShadowTransitionReport {
+        Ok(ShadowTransitionReport {
             previous_root,
             new_root: incremental_root,
             spent: spent.len(),
             created: created.len(),
-            resulting_utxos: staged.len(),
-        };
+            resulting_utxos: self.len(),
+        })
+    }
+}
 
-        // Atomic commit of the experimental shadow state.
-        *self = staged;
+#[derive(Clone, Debug)]
+enum ShadowUndo {
+    Restore {
+        commitment: [u8; 32],
+        entry: UtxoEntry,
+    },
+    Remove {
+        commitment: [u8; 32],
+    },
+}
 
-        Ok(report)
+/// Restore a partially mutated authenticated shadow state.
+///
+/// Operations are reversed in strict LIFO order.
+/// Because `insert` and `remove` deterministically rebuild
+/// every affected Merkle path, rollback restores both the
+/// logical UTXO map and the authenticated node map.
+fn rollback_shadow(tree: &mut AuthenticatedUtxoTree, undo: &mut Vec<ShadowUndo>) {
+    while let Some(operation) = undo.pop() {
+        match operation {
+            ShadowUndo::Restore { commitment, entry } => {
+                let replaced = tree.insert(commitment, entry);
+
+                debug_assert!(
+                    replaced.is_none(),
+                    "shadow rollback unexpectedly replaced a UTXO"
+                );
+            }
+
+            ShadowUndo::Remove { commitment } => {
+                let removed = tree.remove(&commitment);
+
+                debug_assert!(removed.is_some(), "shadow rollback lost a created UTXO");
+            }
+        }
     }
 }
 
@@ -917,5 +979,99 @@ mod shadow_transition_tests {
         assert_eq!(shadow.root(), rebuilt.root());
 
         assert_eq!(shadow.len(), canonical.entries.len());
+    }
+}
+
+#[cfg(test)]
+mod shadow_undo_tests {
+    use super::*;
+
+    fn entry(marker: u8, height: u64, coinbase: bool) -> UtxoEntry {
+        UtxoEntry {
+            output_pk: [marker; 32],
+            height,
+            is_coinbase: coinbase,
+        }
+    }
+
+    #[test]
+    fn rollback_after_multiple_mutations_restores_exact_tree() {
+        let k1 = [0x91; 32];
+        let k2 = [0x92; 32];
+        let k3 = [0x93; 32];
+        let k4 = [0x94; 32];
+
+        let mut canonical_before = UtxoSet::new();
+
+        canonical_before.entries.insert(k1, entry(1, 100, false));
+
+        canonical_before.entries.insert(k2, entry(2, 101, true));
+
+        canonical_before.entries.insert(k3, entry(3, 102, false));
+
+        let mut shadow = AuthenticatedUtxoTree::from_utxo_set(&canonical_before);
+
+        let root_before = shadow.root();
+        let entries_before = shadow.entries.clone();
+        let nodes_before = shadow.nodes.clone();
+
+        // Deliberately incorrect canonical post-state.
+        //
+        // The transition itself performs several valid mutations
+        // before the final canonical comparison fails.
+        let wrong_after = canonical_before.clone();
+
+        let result =
+            shadow.apply_delta_checked(&[k1, k2], &[(k4, entry(4, 103, false))], &wrong_after);
+
+        assert!(matches!(
+            result,
+            Err(ShadowStateError::CanonicalStateMismatch { .. })
+        ));
+
+        // Strong rollback requirement:
+        // not merely logical equality, but identical leaf map,
+        // identical sparse-node map and identical root.
+        assert_eq!(shadow.entries, entries_before);
+
+        assert_eq!(shadow.nodes, nodes_before);
+
+        assert_eq!(shadow.root(), root_before);
+    }
+
+    #[test]
+    fn rollback_after_duplicate_creation_restores_prior_spends() {
+        let spent = [0xa1; 32];
+        let duplicate = [0xa2; 32];
+
+        let mut canonical = UtxoSet::new();
+
+        canonical.entries.insert(spent, entry(1, 1, false));
+
+        canonical.entries.insert(duplicate, entry(2, 2, false));
+
+        let mut shadow = AuthenticatedUtxoTree::from_utxo_set(&canonical);
+
+        let root_before = shadow.root();
+        let entries_before = shadow.entries.clone();
+        let nodes_before = shadow.nodes.clone();
+
+        // The spend succeeds first. Creation then collides.
+        // The successful spend must be rolled back.
+        let result =
+            shadow.apply_delta_checked(&[spent], &[(duplicate, entry(9, 9, true))], &canonical);
+
+        assert_eq!(
+            result,
+            Err(ShadowStateError::DuplicateCreatedUtxo {
+                commitment: duplicate,
+            })
+        );
+
+        assert_eq!(shadow.entries, entries_before);
+
+        assert_eq!(shadow.nodes, nodes_before);
+
+        assert_eq!(shadow.root(), root_before);
     }
 }
