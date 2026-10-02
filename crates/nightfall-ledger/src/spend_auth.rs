@@ -227,6 +227,199 @@ impl StealthOffsetV1 {
     }
 }
 
+/// Prototype container joining all cut-through authorization material.
+///
+/// This remains deliberately separate from [`crate::Transaction`] and
+/// [`crate::BlockBody`]. It is not consensus-active yet.
+///
+/// Canonical `Ko` values are intentionally NOT stored here. They must be
+/// supplied by authoritative UTXO state during validation.
+///
+/// Kernel-to-stealth-excess binding is also intentionally deferred to the
+/// kernel-integration phase. This type proves that the authorization material
+/// itself can be validated and aggregated atomically before changing the
+/// active transaction format.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationBundleV1 {
+    /// One independent `Ks` authorization for each retained output.
+    pub sender_authorizations: Vec<SenderAuthorizationV1>,
+
+    /// One `Ki` spend authorization for each retained input.
+    pub input_authorizations: Vec<SpendAuthorizationV1>,
+
+    /// Retained aggregate stealth excess material `E'`.
+    pub stealth_excesses: Vec<StealthExcessV1>,
+
+    /// Aggregate stealth offset `x'`.
+    pub stealth_offset: StealthOffsetV1,
+}
+
+/// Failure while validating or aggregating an authorization bundle.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AuthorizationBundleError {
+    #[error("sender authorization count mismatch: got {got}, expected {expected}")]
+    SenderCountMismatch { got: usize, expected: usize },
+
+    #[error("input authorization count mismatch: got {got}, expected {expected}")]
+    InputCountMismatch { got: usize, expected: usize },
+
+    #[error("canonical Ko count mismatch: got {got}, expected {expected}")]
+    CanonicalKoCountMismatch { got: usize, expected: usize },
+
+    #[error("invalid sender authorization at index {index}")]
+    InvalidSenderAuthorization { index: usize },
+
+    #[error("invalid input authorization at index {index}")]
+    InvalidInputAuthorization { index: usize },
+
+    #[error("malformed stealth excess at index {index}")]
+    MalformedStealthExcess { index: usize },
+
+    #[error("non-canonical stealth offset")]
+    NonCanonicalStealthOffset,
+
+    #[error("aggregate stealth authorization balance does not hold")]
+    StealthBalanceMismatch,
+}
+
+impl AuthorizationBundleV1 {
+    /// Perform context-free checks that are safe without UTXO/output context.
+    fn validate_intrinsic(&self) -> Result<Scalar, AuthorizationBundleError> {
+        for (index, excess) in self.stealth_excesses.iter().enumerate() {
+            if !excess.is_well_formed() {
+                return Err(AuthorizationBundleError::MalformedStealthExcess { index });
+            }
+        }
+
+        self.stealth_offset
+            .scalar()
+            .ok_or(AuthorizationBundleError::NonCanonicalStealthOffset)
+    }
+
+    /// Validate the complete authorization bundle against authoritative
+    /// transaction/output context.
+    ///
+    /// `outputs` supplies the complete output data signed by each `Ks`.
+    ///
+    /// `input_commits` supplies the commitment referenced by each input.
+    ///
+    /// `canonical_kos` MUST come from authoritative UTXO state. A caller must
+    /// never substitute a Ko supplied by an untrusted input.
+    pub fn validate(
+        &self,
+        outputs: &[nightfall_crypto::Output],
+        input_commits: &[Commitment],
+        canonical_kos: &[[u8; 32]],
+    ) -> Result<(), AuthorizationBundleError> {
+        if self.sender_authorizations.len() != outputs.len() {
+            return Err(AuthorizationBundleError::SenderCountMismatch {
+                got: self.sender_authorizations.len(),
+                expected: outputs.len(),
+            });
+        }
+
+        if self.input_authorizations.len() != input_commits.len() {
+            return Err(AuthorizationBundleError::InputCountMismatch {
+                got: self.input_authorizations.len(),
+                expected: input_commits.len(),
+            });
+        }
+
+        if canonical_kos.len() != input_commits.len() {
+            return Err(AuthorizationBundleError::CanonicalKoCountMismatch {
+                got: canonical_kos.len(),
+                expected: input_commits.len(),
+            });
+        }
+
+        let stealth_offset = self.validate_intrinsic()?;
+
+        for (index, (auth, output)) in self
+            .sender_authorizations
+            .iter()
+            .zip(outputs.iter())
+            .enumerate()
+        {
+            if !auth.verify(output) {
+                return Err(AuthorizationBundleError::InvalidSenderAuthorization { index });
+            }
+        }
+
+        for index in 0..self.input_authorizations.len() {
+            if !self.input_authorizations[index]
+                .verify(&input_commits[index], &canonical_kos[index])
+            {
+                return Err(AuthorizationBundleError::InvalidInputAuthorization { index });
+            }
+        }
+
+        let sender_keys: Vec<[u8; 32]> = self
+            .sender_authorizations
+            .iter()
+            .map(|auth| auth.key)
+            .collect();
+
+        let input_keys: Vec<[u8; 32]> = self
+            .input_authorizations
+            .iter()
+            .map(|auth| auth.ki)
+            .collect();
+
+        let excesses: Vec<Commitment> = self
+            .stealth_excesses
+            .iter()
+            .map(|excess| excess.point)
+            .collect();
+
+        if !verify_stealth_balance(
+            &sender_keys,
+            &input_keys,
+            canonical_kos,
+            &excesses,
+            &stealth_offset,
+        ) {
+            return Err(AuthorizationBundleError::StealthBalanceMismatch);
+        }
+
+        Ok(())
+    }
+
+    /// Aggregate two bundles without mutating either source.
+    ///
+    /// Failure is atomic: malformed excess/offset material returns an error and
+    /// neither original bundle is changed.
+    pub fn checked_aggregate(&self, other: &Self) -> Result<Self, AuthorizationBundleError> {
+        let left_offset = self.validate_intrinsic()?;
+        let right_offset = other.validate_intrinsic()?;
+
+        let mut sender_authorizations = Vec::with_capacity(
+            self.sender_authorizations.len() + other.sender_authorizations.len(),
+        );
+
+        sender_authorizations.extend(self.sender_authorizations.iter().copied());
+        sender_authorizations.extend(other.sender_authorizations.iter().copied());
+
+        let mut input_authorizations =
+            Vec::with_capacity(self.input_authorizations.len() + other.input_authorizations.len());
+
+        input_authorizations.extend(self.input_authorizations.iter().copied());
+        input_authorizations.extend(other.input_authorizations.iter().copied());
+
+        let mut stealth_excesses =
+            Vec::with_capacity(self.stealth_excesses.len() + other.stealth_excesses.len());
+
+        stealth_excesses.extend(self.stealth_excesses.iter().copied());
+        stealth_excesses.extend(other.stealth_excesses.iter().copied());
+
+        Ok(Self {
+            sender_authorizations,
+            input_authorizations,
+            stealth_excesses,
+            stealth_offset: StealthOffsetV1::from_scalar(&(left_offset + right_offset)),
+        })
+    }
+}
+
 /// H(Ki || Ko), interpreted as a scalar.
 ///
 /// Point validity is checked by [`input_verification_key`]. Keeping challenge
@@ -1010,5 +1203,223 @@ mod tests {
             verify_stealth_balance(&[sender.key], &input_keys, &spent_keys, &excesses, &offset,),
             "independent Ks must compose with stealth balance",
         );
+    }
+
+    fn valid_authorization_bundle_fixture() -> (
+        AuthorizationBundleV1,
+        Vec<nightfall_crypto::Output>,
+        Vec<Commitment>,
+        Vec<[u8; 32]>,
+    ) {
+        let spend_receiver = WalletKeys::generate();
+
+        let (spent_output, _) = create_output(
+            &spend_receiver.address(),
+            12_345,
+            "spent",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("spent output");
+
+        let discovered = scan_output(&spend_receiver.view_key(), &spent_output)
+            .expect("receiver discovers spent output");
+
+        let ko_secret = discovered.spend_secret(&spend_receiver);
+
+        assert_eq!(
+            (generator_g() * ko_secret).compress().to_bytes(),
+            spent_output.output_pk,
+        );
+
+        let new_receiver = WalletKeys::generate();
+
+        let (new_output, _) = create_output(
+            &new_receiver.address(),
+            12_000,
+            "new",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("new output");
+
+        let ks = Scalar::random(&mut OsRng);
+        let ki = Scalar::random(&mut OsRng);
+        let excess_secret = Scalar::random(&mut OsRng);
+
+        let sender_auth = SenderAuthorizationV1::sign(&new_output, &ks);
+
+        let input_auth = SpendAuthorizationV1::sign(
+            &spent_output.commit,
+            &ki,
+            &ko_secret,
+            &spent_output.output_pk,
+        )
+        .expect("input authorization");
+
+        let excess = StealthExcessV1::new(Commitment::from_point(generator_g() * excess_secret))
+            .expect("stealth excess");
+
+        let offset = stealth_offset_secret(&[ks], &[ki], &[ko_secret], &[excess_secret]);
+
+        let bundle = AuthorizationBundleV1 {
+            sender_authorizations: vec![sender_auth],
+            input_authorizations: vec![input_auth],
+            stealth_excesses: vec![excess],
+            stealth_offset: StealthOffsetV1::from_scalar(&offset),
+        };
+
+        (
+            bundle,
+            vec![new_output],
+            vec![spent_output.commit],
+            vec![spent_output.output_pk],
+        )
+    }
+
+    #[test]
+    fn authorization_bundle_validates_atomically() {
+        let (bundle, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        assert_eq!(bundle.validate(&outputs, &commits, &kos,), Ok(()),);
+    }
+
+    #[test]
+    fn authorization_bundle_rejects_sender_tampering() {
+        let (mut bundle, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        bundle.sender_authorizations[0].key = (generator_g() * Scalar::random(&mut OsRng))
+            .compress()
+            .to_bytes();
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos,),
+            Err(AuthorizationBundleError::InvalidSenderAuthorization { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn authorization_bundle_rejects_input_tampering() {
+        let (mut bundle, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        bundle.input_authorizations[0].ki = (generator_g() * Scalar::random(&mut OsRng))
+            .compress()
+            .to_bytes();
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos,),
+            Err(AuthorizationBundleError::InvalidInputAuthorization { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn authorization_bundle_rejects_ko_substitution() {
+        let (bundle, outputs, commits, mut kos) = valid_authorization_bundle_fixture();
+
+        kos[0] = (generator_g() * Scalar::random(&mut OsRng))
+            .compress()
+            .to_bytes();
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos,),
+            Err(AuthorizationBundleError::InvalidInputAuthorization { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn authorization_bundle_rejects_wrong_offset() {
+        let (mut bundle, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        let current = bundle.stealth_offset.scalar().expect("canonical");
+
+        bundle.stealth_offset = StealthOffsetV1::from_scalar(&(current + Scalar::ONE));
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos,),
+            Err(AuthorizationBundleError::StealthBalanceMismatch),
+        );
+    }
+
+    #[test]
+    fn authorization_bundle_rejects_malformed_excess() {
+        let (mut bundle, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        bundle.stealth_excesses[0] = StealthExcessV1 {
+            point: Commitment([0xff; 32]),
+        };
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos,),
+            Err(AuthorizationBundleError::MalformedStealthExcess { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn authorization_bundle_rejects_noncanonical_offset() {
+        let (mut bundle, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        bundle.stealth_offset = StealthOffsetV1 { bytes: [0xff; 32] };
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos,),
+            Err(AuthorizationBundleError::NonCanonicalStealthOffset),
+        );
+    }
+
+    #[test]
+    fn authorization_bundles_aggregate_and_still_validate() {
+        let (first, mut outputs, mut commits, mut kos) = valid_authorization_bundle_fixture();
+
+        let (second, outputs_b, commits_b, kos_b) = valid_authorization_bundle_fixture();
+
+        let aggregate = first.checked_aggregate(&second).expect("valid aggregation");
+
+        outputs.extend(outputs_b);
+        commits.extend(commits_b);
+        kos.extend(kos_b);
+
+        assert_eq!(
+            aggregate.validate(&outputs, &commits, &kos,),
+            Ok(()),
+            "aggregated authorization material must remain valid",
+        );
+
+        assert_eq!(aggregate.sender_authorizations.len(), 2,);
+
+        assert_eq!(aggregate.input_authorizations.len(), 2,);
+
+        assert_eq!(aggregate.stealth_excesses.len(), 2,);
+    }
+
+    #[test]
+    fn failed_bundle_aggregation_does_not_mutate_sources() {
+        let (first, _outputs_a, _commits_a, _kos_a) = valid_authorization_bundle_fixture();
+
+        let (mut second, _outputs_b, _commits_b, _kos_b) = valid_authorization_bundle_fixture();
+
+        second.stealth_offset = StealthOffsetV1 { bytes: [0xff; 32] };
+
+        let first_before = first.clone();
+        let second_before = second.clone();
+
+        assert_eq!(
+            first.checked_aggregate(&second),
+            Err(AuthorizationBundleError::NonCanonicalStealthOffset),
+        );
+
+        assert_eq!(first, first_before);
+        assert_eq!(second, second_before);
+    }
+
+    #[test]
+    fn authorization_bundle_roundtrips_exactly() {
+        let (bundle, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        let encoded = serde_json::to_vec(&bundle).expect("serialize bundle");
+
+        let decoded: AuthorizationBundleV1 =
+            serde_json::from_slice(&encoded).expect("deserialize bundle");
+
+        assert_eq!(decoded, bundle);
+
+        assert_eq!(decoded.validate(&outputs, &commits, &kos,), Ok(()),);
     }
 }
