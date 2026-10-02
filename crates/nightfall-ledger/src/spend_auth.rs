@@ -350,6 +350,168 @@ pub fn kernel_stealth_binding_message(
     .to_vec()
 }
 
+/// Kernel-bound version of the cut-through authorization bundle.
+///
+/// Unlike [`AuthorizationBundleV1`], stealth excesses cannot exist here as
+/// loose points: every `E'` is carried inside a [`KernelStealthBindingV1`].
+///
+/// The `kernels` slice passed to [`Self::validate`] is positionally paired
+/// with `kernel_bindings`. This is still prototype-only and is deliberately
+/// not part of the active transaction or block format.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelBoundAuthorizationBundleV1 {
+    pub sender_authorizations: Vec<SenderAuthorizationV1>,
+    pub input_authorizations: Vec<SpendAuthorizationV1>,
+
+    /// Every retained stealth excess must be authorized by a concrete value
+    /// kernel.
+    pub kernel_bindings: Vec<KernelStealthBindingV1>,
+
+    pub stealth_offset: StealthOffsetV1,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum KernelBoundAuthorizationBundleError {
+    #[error("kernel binding count mismatch: got {got}, expected {expected}")]
+    KernelBindingCountMismatch { got: usize, expected: usize },
+
+    #[error("duplicate kernel binding at index {index}")]
+    DuplicateKernelBinding { index: usize },
+
+    #[error("invalid kernel/stealth binding at index {index}")]
+    InvalidKernelStealthBinding { index: usize },
+
+    #[error("malformed stealth excess at index {index}")]
+    MalformedBoundStealthExcess { index: usize },
+
+    #[error("non-canonical stealth offset")]
+    NonCanonicalStealthOffset,
+
+    #[error("authorization bundle validation failed: {0}")]
+    Authorization(AuthorizationBundleError),
+}
+
+impl KernelBoundAuthorizationBundleV1 {
+    /// Validate material that does not require transaction or kernel context.
+    fn validate_intrinsic(&self) -> Result<Scalar, KernelBoundAuthorizationBundleError> {
+        for (index, binding) in self.kernel_bindings.iter().enumerate() {
+            if !binding.stealth_excess.is_well_formed() {
+                return Err(
+                    KernelBoundAuthorizationBundleError::MalformedBoundStealthExcess { index },
+                );
+            }
+        }
+
+        self.stealth_offset
+            .scalar()
+            .ok_or(KernelBoundAuthorizationBundleError::NonCanonicalStealthOffset)
+    }
+
+    /// Validate the complete kernel-bound authorization package.
+    ///
+    /// `canonical_kos` must come from authoritative UTXO state.
+    ///
+    /// `kernels[index]` is the exact kernel authorized by
+    /// `kernel_bindings[index]`.
+    pub fn validate(
+        &self,
+        outputs: &[nightfall_crypto::Output],
+        input_commits: &[Commitment],
+        canonical_kos: &[[u8; 32]],
+        kernels: &[TxKernel],
+    ) -> Result<(), KernelBoundAuthorizationBundleError> {
+        if self.kernel_bindings.len() != kernels.len() {
+            return Err(
+                KernelBoundAuthorizationBundleError::KernelBindingCountMismatch {
+                    got: self.kernel_bindings.len(),
+                    expected: kernels.len(),
+                },
+            );
+        }
+
+        let stealth_offset = self.validate_intrinsic()?;
+
+        let mut seen_kernels = std::collections::BTreeSet::new();
+
+        for (index, (binding, kernel)) in
+            self.kernel_bindings.iter().zip(kernels.iter()).enumerate()
+        {
+            // Match the identity used by TxKernel::id(): excess + nonce R.
+            let identity = (kernel.excess.0, kernel.excess_sig.r);
+
+            if !seen_kernels.insert(identity) {
+                return Err(KernelBoundAuthorizationBundleError::DuplicateKernelBinding { index });
+            }
+
+            if !binding.verify(kernel) {
+                return Err(
+                    KernelBoundAuthorizationBundleError::InvalidKernelStealthBinding { index },
+                );
+            }
+        }
+
+        let loose = AuthorizationBundleV1 {
+            sender_authorizations: self.sender_authorizations.clone(),
+
+            input_authorizations: self.input_authorizations.clone(),
+
+            stealth_excesses: self
+                .kernel_bindings
+                .iter()
+                .map(|binding| binding.stealth_excess)
+                .collect(),
+
+            stealth_offset: StealthOffsetV1::from_scalar(&stealth_offset),
+        };
+
+        loose
+            .validate(outputs, input_commits, canonical_kos)
+            .map_err(KernelBoundAuthorizationBundleError::Authorization)
+    }
+
+    /// Aggregate two kernel-bound bundles without changing either source.
+    ///
+    /// Kernel bindings stay paired with their E' values and are never split.
+    pub fn checked_aggregate(
+        &self,
+        other: &Self,
+    ) -> Result<Self, KernelBoundAuthorizationBundleError> {
+        let left_offset = self.validate_intrinsic()?;
+
+        let right_offset = other.validate_intrinsic()?;
+
+        let mut sender_authorizations = Vec::with_capacity(
+            self.sender_authorizations.len() + other.sender_authorizations.len(),
+        );
+
+        sender_authorizations.extend(self.sender_authorizations.iter().copied());
+
+        sender_authorizations.extend(other.sender_authorizations.iter().copied());
+
+        let mut input_authorizations =
+            Vec::with_capacity(self.input_authorizations.len() + other.input_authorizations.len());
+
+        input_authorizations.extend(self.input_authorizations.iter().copied());
+
+        input_authorizations.extend(other.input_authorizations.iter().copied());
+
+        let mut kernel_bindings =
+            Vec::with_capacity(self.kernel_bindings.len() + other.kernel_bindings.len());
+
+        kernel_bindings.extend(self.kernel_bindings.iter().copied());
+
+        kernel_bindings.extend(other.kernel_bindings.iter().copied());
+
+        Ok(Self {
+            sender_authorizations,
+            input_authorizations,
+            kernel_bindings,
+
+            stealth_offset: StealthOffsetV1::from_scalar(&(left_offset + right_offset)),
+        })
+    }
+}
+
 /// Prototype container joining all cut-through authorization material.
 ///
 /// This remains deliberately separate from [`crate::Transaction`] and
@@ -1678,6 +1840,197 @@ mod tests {
         assert!(
             decoded.verify(&kernel),
             "round-tripped binding must still verify",
+        );
+    }
+
+    fn kernel_bound_bundle_fixture() -> (
+        KernelBoundAuthorizationBundleV1,
+        Vec<nightfall_crypto::Output>,
+        Vec<Commitment>,
+        Vec<[u8; 32]>,
+        Vec<TxKernel>,
+    ) {
+        let (loose, outputs, commits, kos) = valid_authorization_bundle_fixture();
+
+        assert_eq!(
+            loose.stealth_excesses.len(),
+            1,
+            "fixture expects exactly one E'",
+        );
+
+        let kernel_secret = Scalar::random(&mut OsRng);
+
+        let kernel = nightfall_crypto::build_kernel(
+            nightfall_crypto::KernelFeature::Plain,
+            0,
+            0,
+            0,
+            &kernel_secret,
+        );
+
+        assert!(kernel.verify_signature());
+
+        let binding =
+            KernelStealthBindingV1::sign(&kernel, &kernel_secret, loose.stealth_excesses[0])
+                .expect("kernel/E' binding");
+
+        let bundle = KernelBoundAuthorizationBundleV1 {
+            sender_authorizations: loose.sender_authorizations,
+
+            input_authorizations: loose.input_authorizations,
+
+            kernel_bindings: vec![binding],
+
+            stealth_offset: loose.stealth_offset,
+        };
+
+        (bundle, outputs, commits, kos, vec![kernel])
+    }
+
+    #[test]
+    fn kernel_bound_bundle_validates_atomically() {
+        let (bundle, outputs, commits, kos, kernels) = kernel_bound_bundle_fixture();
+
+        assert_eq!(bundle.validate(&outputs, &commits, &kos, &kernels,), Ok(()),);
+    }
+
+    #[test]
+    fn kernel_bound_bundle_rejects_kernel_substitution() {
+        let (bundle, outputs, commits, kos, mut kernels) = kernel_bound_bundle_fixture();
+
+        let replacement_secret = Scalar::random(&mut OsRng);
+
+        kernels[0] = nightfall_crypto::build_kernel(
+            nightfall_crypto::KernelFeature::Plain,
+            0,
+            0,
+            0,
+            &replacement_secret,
+        );
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos, &kernels,),
+            Err(KernelBoundAuthorizationBundleError::InvalidKernelStealthBinding { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn kernel_bound_bundle_rejects_binding_excess_substitution() {
+        let (mut bundle, outputs, commits, kos, kernels) = kernel_bound_bundle_fixture();
+
+        let replacement = Scalar::random(&mut OsRng);
+
+        bundle.kernel_bindings[0].stealth_excess =
+            StealthExcessV1::new(Commitment::from_point(generator_g() * replacement))
+                .expect("replacement E'");
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos, &kernels,),
+            Err(KernelBoundAuthorizationBundleError::InvalidKernelStealthBinding { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn kernel_bound_bundle_requires_one_kernel_per_binding() {
+        let (bundle, outputs, commits, kos, _kernels) = kernel_bound_bundle_fixture();
+
+        assert_eq!(
+            bundle.validate(&outputs, &commits, &kos, &[],),
+            Err(
+                KernelBoundAuthorizationBundleError::KernelBindingCountMismatch {
+                    got: 1,
+                    expected: 0,
+                }
+            ),
+        );
+    }
+
+    #[test]
+    fn kernel_bound_bundle_rejects_duplicate_kernel_binding() {
+        let (first, mut outputs, mut commits, mut kos, kernels) = kernel_bound_bundle_fixture();
+
+        let mut duplicate = first.clone();
+
+        // Preserve a mathematically valid doubled stealth balance.
+        duplicate.stealth_offset = first.stealth_offset;
+
+        let aggregate = first
+            .checked_aggregate(&duplicate)
+            .expect("structural aggregation");
+
+        let first_outputs = outputs.clone();
+        let first_commits = commits.clone();
+        let first_kos = kos.clone();
+
+        outputs.extend(first_outputs);
+        commits.extend(first_commits);
+        kos.extend(first_kos);
+
+        let duplicate_kernels = vec![kernels[0].clone(), kernels[0].clone()];
+
+        assert_eq!(
+            aggregate.validate(&outputs, &commits, &kos, &duplicate_kernels,),
+            Err(KernelBoundAuthorizationBundleError::DuplicateKernelBinding { index: 1 }),
+        );
+    }
+
+    #[test]
+    fn kernel_bound_bundles_aggregate_and_validate() {
+        let (first, mut outputs, mut commits, mut kos, mut kernels) = kernel_bound_bundle_fixture();
+
+        let (second, outputs_b, commits_b, kos_b, kernels_b) = kernel_bound_bundle_fixture();
+
+        let aggregate = first.checked_aggregate(&second).expect("valid aggregation");
+
+        outputs.extend(outputs_b);
+        commits.extend(commits_b);
+        kos.extend(kos_b);
+        kernels.extend(kernels_b);
+
+        assert_eq!(
+            aggregate.validate(&outputs, &commits, &kos, &kernels,),
+            Ok(()),
+        );
+
+        assert_eq!(aggregate.kernel_bindings.len(), 2,);
+    }
+
+    #[test]
+    fn failed_kernel_bound_aggregation_is_atomic() {
+        let (first, _outputs_a, _commits_a, _kos_a, _kernels_a) = kernel_bound_bundle_fixture();
+
+        let (mut second, _outputs_b, _commits_b, _kos_b, _kernels_b) =
+            kernel_bound_bundle_fixture();
+
+        second.stealth_offset = StealthOffsetV1 { bytes: [0xff; 32] };
+
+        let first_before = first.clone();
+
+        let second_before = second.clone();
+
+        assert_eq!(
+            first.checked_aggregate(&second),
+            Err(KernelBoundAuthorizationBundleError::NonCanonicalStealthOffset),
+        );
+
+        assert_eq!(first, first_before);
+        assert_eq!(second, second_before);
+    }
+
+    #[test]
+    fn kernel_bound_bundle_roundtrips_exactly() {
+        let (bundle, outputs, commits, kos, kernels) = kernel_bound_bundle_fixture();
+
+        let encoded = serde_json::to_vec(&bundle).expect("serialize kernel-bound bundle");
+
+        let decoded: KernelBoundAuthorizationBundleV1 =
+            serde_json::from_slice(&encoded).expect("deserialize kernel-bound bundle");
+
+        assert_eq!(decoded, bundle,);
+
+        assert_eq!(
+            decoded.validate(&outputs, &commits, &kos, &kernels,),
+            Ok(()),
         );
     }
 }
