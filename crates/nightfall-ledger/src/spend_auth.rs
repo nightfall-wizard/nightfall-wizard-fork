@@ -24,6 +24,8 @@ use curve25519_dalek::{
 };
 use nightfall_crypto::{generator_g, hash_multi, sig, Commitment, SchnorrSig};
 
+use serde::{Deserialize, Serialize};
+
 use crate::tx::Transaction;
 
 /// Domain separator for the candidate cut-through input authorization.
@@ -31,6 +33,118 @@ use crate::tx::Transaction;
 /// This primitive is not consensus-active yet. Once activated, changing this
 /// value would be a consensus change.
 pub const INPUT_AUTH_CHALLENGE_DOMAIN: &[u8] = b"nightfall:cutthrough:input-challenge:v1";
+
+/// Fixed-size candidate representation of cut-through-compatible input
+/// authorization.
+///
+/// `Ko` is deliberately absent. The verifier must obtain canonical `Ko` from
+/// trusted ledger state rather than accepting attacker-supplied replacement
+/// metadata.
+///
+/// This type is serializable for prototype work but is NOT consensus-active
+/// and is not yet part of [`crate::Input`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendAuthorizationV1 {
+    /// Fresh ephemeral input public key `Ki = ki*G`.
+    pub ki: [u8; 32],
+
+    /// Schnorr authorization under `Ki + H(Ki || Ko) * Ko`.
+    pub signature: SchnorrSig,
+}
+
+impl SpendAuthorizationV1 {
+    pub fn sign(
+        commit: &Commitment,
+        ki_secret: &Scalar,
+        ko_secret: &Scalar,
+        canonical_ko: &[u8; 32],
+    ) -> Option<Self> {
+        let (ki, signature) = sign_input_authorization(commit, ki_secret, ko_secret, canonical_ko)?;
+
+        Some(Self { ki, signature })
+    }
+
+    /// `canonical_ko` must come from authoritative UTXO state.
+    pub fn verify(&self, commit: &Commitment, canonical_ko: &[u8; 32]) -> bool {
+        verify_input_authorization(commit, &self.ki, &self.signature, canonical_ko)
+    }
+
+    /// Fixed representation: `Ki || R || s`.
+    ///
+    /// Exactly 96 bytes.
+    pub fn canonical_bytes(&self) -> [u8; 96] {
+        let mut out = [0u8; 96];
+
+        out[..32].copy_from_slice(&self.ki);
+        out[32..64].copy_from_slice(&self.signature.r);
+        out[64..96].copy_from_slice(&self.signature.s);
+
+        out
+    }
+}
+
+/// Fixed-size representation of one stealth excess `E'`.
+///
+/// `Commitment` is reused solely as Nightfall's existing compressed
+/// Ristretto-point container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StealthExcessV1 {
+    pub point: Commitment,
+}
+
+impl StealthExcessV1 {
+    pub fn new(point: Commitment) -> Option<Self> {
+        point.point()?;
+        Some(Self { point })
+    }
+
+    pub fn is_well_formed(&self) -> bool {
+        self.point.point().is_some()
+    }
+
+    pub fn canonical_bytes(&self) -> [u8; 32] {
+        self.point.0
+    }
+}
+
+/// Canonically encoded aggregate stealth offset `x'`.
+///
+/// The scalar is retained as its canonical 32-byte representation so malformed
+/// encodings are rejected instead of silently reduced modulo the group order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StealthOffsetV1 {
+    pub bytes: [u8; 32],
+}
+
+impl StealthOffsetV1 {
+    pub fn from_scalar(value: &Scalar) -> Self {
+        Self {
+            bytes: value.to_bytes(),
+        }
+    }
+
+    pub fn scalar(&self) -> Option<Scalar> {
+        Option::<Scalar>::from(Scalar::from_canonical_bytes(self.bytes))
+    }
+
+    pub fn is_canonical(&self) -> bool {
+        self.scalar().is_some()
+    }
+
+    /// Aggregate offsets as field elements:
+    ///
+    /// `x'_agg = x'_1 + x'_2 mod p`.
+    pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        let left = self.scalar()?;
+        let right = other.scalar()?;
+
+        Some(Self::from_scalar(&(left + right)))
+    }
+
+    pub fn canonical_bytes(&self) -> [u8; 32] {
+        self.bytes
+    }
+}
 
 /// H(Ki || Ko), interpreted as a scalar.
 ///
@@ -511,6 +625,141 @@ mod tests {
                 &Scalar::ZERO,
             ),
             "malformed stealth excess must fail closed",
+        );
+    }
+
+    #[test]
+    fn candidate_input_authorization_roundtrips_exactly() {
+        let (_receiver, output, ko_secret) = owned_output();
+        let ki_secret = Scalar::random(&mut OsRng);
+
+        let auth =
+            SpendAuthorizationV1::sign(&output.commit, &ki_secret, &ko_secret, &output.output_pk)
+                .expect("valid authorization");
+
+        assert!(
+            auth.verify(&output.commit, &output.output_pk),
+            "typed authorization must verify",
+        );
+
+        let canonical = auth.canonical_bytes();
+
+        let encoded = serde_json::to_vec(&auth).expect("serialize authorization");
+
+        let decoded: SpendAuthorizationV1 =
+            serde_json::from_slice(&encoded).expect("deserialize authorization");
+
+        assert_eq!(decoded, auth);
+        assert_eq!(decoded.canonical_bytes(), canonical);
+        assert_eq!(canonical.len(), 96);
+    }
+
+    #[test]
+    fn candidate_authorization_still_requires_canonical_ko() {
+        let (_receiver, output, ko_secret) = owned_output();
+        let ki_secret = Scalar::random(&mut OsRng);
+
+        let auth =
+            SpendAuthorizationV1::sign(&output.commit, &ki_secret, &ko_secret, &output.output_pk)
+                .expect("valid authorization");
+
+        let replacement_secret = Scalar::random(&mut OsRng);
+
+        let replacement_ko = (generator_g() * replacement_secret).compress().to_bytes();
+
+        assert!(
+            !auth.verify(&output.commit, &replacement_ko,),
+            "typed authorization must remain bound to canonical Ko",
+        );
+    }
+
+    #[test]
+    fn stealth_offset_requires_canonical_scalar_encoding() {
+        let value = Scalar::random(&mut OsRng);
+
+        let offset = StealthOffsetV1::from_scalar(&value);
+
+        assert!(offset.is_canonical());
+        assert_eq!(offset.scalar(), Some(value));
+
+        let malformed = StealthOffsetV1 { bytes: [0xff; 32] };
+
+        assert!(
+            !malformed.is_canonical(),
+            "non-canonical scalar encoding must fail closed",
+        );
+
+        assert!(malformed.scalar().is_none());
+    }
+
+    #[test]
+    fn stealth_offsets_compose_as_scalars() {
+        let a = Scalar::random(&mut OsRng);
+        let b = Scalar::random(&mut OsRng);
+
+        let encoded_a = StealthOffsetV1::from_scalar(&a);
+
+        let encoded_b = StealthOffsetV1::from_scalar(&b);
+
+        let aggregate = encoded_a
+            .checked_add(&encoded_b)
+            .expect("canonical offsets");
+
+        assert_eq!(
+            aggregate.scalar(),
+            Some(a + b),
+            "offset aggregation must preserve scalar addition",
+        );
+    }
+
+    #[test]
+    fn malformed_offset_cannot_participate_in_aggregation() {
+        let valid = StealthOffsetV1::from_scalar(&Scalar::random(&mut OsRng));
+
+        let malformed = StealthOffsetV1 { bytes: [0xff; 32] };
+
+        assert!(malformed.checked_add(&valid).is_none());
+        assert!(valid.checked_add(&malformed).is_none());
+    }
+
+    #[test]
+    fn stealth_offset_roundtrips_without_reduction() {
+        let value = Scalar::random(&mut OsRng);
+
+        let offset = StealthOffsetV1::from_scalar(&value);
+
+        let encoded = serde_json::to_vec(&offset).expect("serialize offset");
+
+        let decoded: StealthOffsetV1 =
+            serde_json::from_slice(&encoded).expect("deserialize offset");
+
+        assert_eq!(decoded, offset);
+        assert_eq!(decoded.scalar(), Some(value));
+        assert_eq!(decoded.canonical_bytes(), value.to_bytes(),);
+    }
+
+    #[test]
+    fn stealth_excess_roundtrips_exactly() {
+        let secret = Scalar::random(&mut OsRng);
+
+        let point = Commitment::from_point(generator_g() * secret);
+
+        let excess = StealthExcessV1::new(point).expect("valid excess");
+
+        let encoded = serde_json::to_vec(&excess).expect("serialize excess");
+
+        let decoded: StealthExcessV1 =
+            serde_json::from_slice(&encoded).expect("deserialize excess");
+
+        assert_eq!(decoded, excess);
+        assert_eq!(decoded.canonical_bytes(), point.0,);
+    }
+
+    #[test]
+    fn stealth_excess_rejects_malformed_points() {
+        assert!(
+            StealthExcessV1::new(Commitment([0xff; 32])).is_none(),
+            "malformed compressed point must fail closed",
         );
     }
 }
