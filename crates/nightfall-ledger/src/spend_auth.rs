@@ -20,6 +20,7 @@
 use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
+    traits::Identity,
 };
 use nightfall_crypto::{generator_g, hash_multi, sig, Commitment, SchnorrSig};
 
@@ -115,6 +116,106 @@ pub fn verify_input_authorization(
     let msg = Transaction::input_message(commit);
 
     sig::verify(&key, &generator_g(), &msg, signature)
+}
+
+/// Sum compressed Ristretto public keys, failing closed if any key is
+/// malformed.
+///
+/// This helper is intentionally private: callers should use the complete
+/// stealth-balance verifier rather than constructing partial equations.
+fn sum_public_keys(keys: &[[u8; 32]]) -> Option<RistrettoPoint> {
+    let mut sum = RistrettoPoint::identity();
+
+    for key in keys {
+        sum += CompressedRistretto(*key).decompress()?;
+    }
+
+    Some(sum)
+}
+
+/// Construct the scalar stealth offset
+///
+/// `x' = Σks + Σki - Σko - Σe'`
+///
+/// corresponding to the public balance equation
+///
+/// `ΣKs + ΣKi - ΣKo = ΣE' + x'G`.
+///
+/// This is a construction helper only. Consensus must verify the public
+/// equation independently.
+pub fn stealth_offset_secret(
+    sender_secrets: &[Scalar],
+    input_ephemeral_secrets: &[Scalar],
+    spent_output_secrets: &[Scalar],
+    stealth_excess_secrets: &[Scalar],
+) -> Scalar {
+    let mut offset = Scalar::ZERO;
+
+    for secret in sender_secrets {
+        offset += *secret;
+    }
+
+    for secret in input_ephemeral_secrets {
+        offset += *secret;
+    }
+
+    for secret in spent_output_secrets {
+        offset -= *secret;
+    }
+
+    for secret in stealth_excess_secrets {
+        offset -= *secret;
+    }
+
+    offset
+}
+
+/// Verify the aggregate stealth-authorization balance:
+///
+/// `ΣKs + ΣKi - ΣKo = ΣE' + x'G`.
+///
+/// * `sender_keys` are the sender authorization keys of retained outputs.
+/// * `input_ephemeral_keys` are the `Ki` values carried by retained inputs.
+/// * `spent_output_keys` are the canonical `Ko` values of those inputs.
+/// * `stealth_excesses` are the retained stealth excess points `E'`.
+/// * `stealth_offset` is the aggregate scalar offset `x'`.
+///
+/// Every compressed point is decompressed here and malformed material fails
+/// closed. This function is deliberately independent of transaction grouping,
+/// which allows offsets and excesses to compose under aggregation.
+pub fn verify_stealth_balance(
+    sender_keys: &[[u8; 32]],
+    input_ephemeral_keys: &[[u8; 32]],
+    spent_output_keys: &[[u8; 32]],
+    stealth_excesses: &[Commitment],
+    stealth_offset: &Scalar,
+) -> bool {
+    let Some(sender_sum) = sum_public_keys(sender_keys) else {
+        return false;
+    };
+
+    let Some(input_sum) = sum_public_keys(input_ephemeral_keys) else {
+        return false;
+    };
+
+    let Some(spent_sum) = sum_public_keys(spent_output_keys) else {
+        return false;
+    };
+
+    let mut excess_sum = RistrettoPoint::identity();
+
+    for excess in stealth_excesses {
+        let Some(point) = excess.point() else {
+            return false;
+        };
+
+        excess_sum += point;
+    }
+
+    let lhs = sender_sum + input_sum - spent_sum;
+    let rhs = excess_sum + generator_g() * *stealth_offset;
+
+    lhs == rhs
 }
 
 #[cfg(test)]
@@ -259,6 +360,157 @@ mod tests {
         assert!(
             !verify_input_authorization(&output.commit, &valid_ki, &signature, &malformed,),
             "malformed Ko must fail",
+        );
+    }
+
+    #[test]
+    fn stealth_balance_accepts_exact_equation() {
+        let ks = Scalar::random(&mut OsRng);
+        let ki = Scalar::random(&mut OsRng);
+        let ko = Scalar::random(&mut OsRng);
+        let excess_secret = Scalar::random(&mut OsRng);
+
+        let offset = stealth_offset_secret(&[ks], &[ki], &[ko], &[excess_secret]);
+
+        let sender_keys = [(generator_g() * ks).compress().to_bytes()];
+        let input_keys = [(generator_g() * ki).compress().to_bytes()];
+        let spent_keys = [(generator_g() * ko).compress().to_bytes()];
+        let excesses = [Commitment::from_point(generator_g() * excess_secret)];
+
+        assert!(
+            verify_stealth_balance(&sender_keys, &input_keys, &spent_keys, &excesses, &offset,),
+            "exact stealth equation must verify",
+        );
+    }
+
+    #[test]
+    fn stealth_balance_composes_under_aggregation() {
+        let ks1 = Scalar::random(&mut OsRng);
+        let ki1 = Scalar::random(&mut OsRng);
+        let ko1 = Scalar::random(&mut OsRng);
+        let e1 = Scalar::random(&mut OsRng);
+
+        let ks2 = Scalar::random(&mut OsRng);
+        let ki2 = Scalar::random(&mut OsRng);
+        let ko2 = Scalar::random(&mut OsRng);
+        let e2 = Scalar::random(&mut OsRng);
+
+        let x1 = stealth_offset_secret(&[ks1], &[ki1], &[ko1], &[e1]);
+
+        let x2 = stealth_offset_secret(&[ks2], &[ki2], &[ko2], &[e2]);
+
+        let aggregate_offset = x1 + x2;
+
+        let sender_keys = [
+            (generator_g() * ks1).compress().to_bytes(),
+            (generator_g() * ks2).compress().to_bytes(),
+        ];
+
+        let input_keys = [
+            (generator_g() * ki1).compress().to_bytes(),
+            (generator_g() * ki2).compress().to_bytes(),
+        ];
+
+        let spent_keys = [
+            (generator_g() * ko1).compress().to_bytes(),
+            (generator_g() * ko2).compress().to_bytes(),
+        ];
+
+        let excesses = [
+            Commitment::from_point(generator_g() * e1),
+            Commitment::from_point(generator_g() * e2),
+        ];
+
+        assert!(
+            verify_stealth_balance(
+                &sender_keys,
+                &input_keys,
+                &spent_keys,
+                &excesses,
+                &aggregate_offset,
+            ),
+            "independent stealth balances must compose exactly",
+        );
+    }
+
+    #[test]
+    fn substituted_canonical_ko_breaks_stealth_balance() {
+        let ks = Scalar::random(&mut OsRng);
+        let ki = Scalar::random(&mut OsRng);
+        let ko = Scalar::random(&mut OsRng);
+        let e = Scalar::random(&mut OsRng);
+
+        let offset = stealth_offset_secret(&[ks], &[ki], &[ko], &[e]);
+
+        let sender_keys = [(generator_g() * ks).compress().to_bytes()];
+
+        let input_keys = [(generator_g() * ki).compress().to_bytes()];
+
+        let replacement_ko = Scalar::random(&mut OsRng);
+
+        let spent_keys = [(generator_g() * replacement_ko).compress().to_bytes()];
+
+        let excesses = [Commitment::from_point(generator_g() * e)];
+
+        assert!(
+            !verify_stealth_balance(&sender_keys, &input_keys, &spent_keys, &excesses, &offset,),
+            "canonical Ko substitution must break the balance",
+        );
+    }
+
+    #[test]
+    fn wrong_stealth_offset_breaks_balance() {
+        let ks = Scalar::random(&mut OsRng);
+        let ki = Scalar::random(&mut OsRng);
+        let ko = Scalar::random(&mut OsRng);
+        let e = Scalar::random(&mut OsRng);
+
+        let correct = stealth_offset_secret(&[ks], &[ki], &[ko], &[e]);
+
+        let wrong = correct + Scalar::ONE;
+
+        let sender_keys = [(generator_g() * ks).compress().to_bytes()];
+        let input_keys = [(generator_g() * ki).compress().to_bytes()];
+        let spent_keys = [(generator_g() * ko).compress().to_bytes()];
+        let excesses = [Commitment::from_point(generator_g() * e)];
+
+        assert!(
+            !verify_stealth_balance(&sender_keys, &input_keys, &spent_keys, &excesses, &wrong,),
+            "arbitrary offset adjustment must fail",
+        );
+    }
+
+    #[test]
+    fn malformed_stealth_balance_material_fails_closed() {
+        let valid = Scalar::random(&mut OsRng);
+        let valid_key = (generator_g() * valid).compress().to_bytes();
+
+        let malformed = [0xff; 32];
+
+        assert!(
+            !verify_stealth_balance(&[malformed], &[valid_key], &[valid_key], &[], &Scalar::ZERO,),
+            "malformed sender key must fail closed",
+        );
+
+        assert!(
+            !verify_stealth_balance(&[valid_key], &[malformed], &[valid_key], &[], &Scalar::ZERO,),
+            "malformed Ki must fail closed",
+        );
+
+        assert!(
+            !verify_stealth_balance(&[valid_key], &[valid_key], &[malformed], &[], &Scalar::ZERO,),
+            "malformed Ko must fail closed",
+        );
+
+        assert!(
+            !verify_stealth_balance(
+                &[valid_key],
+                &[],
+                &[valid_key],
+                &[Commitment(malformed)],
+                &Scalar::ZERO,
+            ),
+            "malformed stealth excess must fail closed",
         );
     }
 }
