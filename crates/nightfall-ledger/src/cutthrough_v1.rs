@@ -13,8 +13,12 @@ use std::collections::BTreeSet;
 
 use curve25519_dalek::{ristretto::CompressedRistretto, scalar::Scalar};
 use nightfall_crypto::{hash_multi, Commitment, Output, TxKernel};
-use nightfall_types::Hash256;
+use nightfall_types::{Hash256, Height};
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    is_mature, KernelBoundAuthorizationBundleError, KernelBoundAuthorizationBundleV1, LedgerState,
+};
 
 use crate::{
     KernelStealthBindingV1, SenderAuthorizationV1, SpendAuthorizationV1, StealthOffsetV1,
@@ -133,6 +137,232 @@ pub enum CutThroughV1Error {
 
     #[error("body is not canonically ordered")]
     NonCanonicalBody,
+}
+
+/// Failure during stateful validation of a v3 cut-through candidate.
+///
+/// This validator is intentionally separate from the active v2 mempool and
+/// block-validation paths.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CutThroughStateError {
+    #[error(transparent)]
+    Shape(#[from] CutThroughV1Error),
+
+    #[error("coinbase material is not accepted by the transfer validator")]
+    CoinbaseInTransfer,
+
+    #[error("input {commit} does not exist in authoritative UTXO state")]
+    UnknownInput { commit: String },
+
+    #[error("immature coinbase: created at {created}, spend attempted at {now}")]
+    ImmatureCoinbaseSpend { created: u64, now: u64 },
+
+    #[error("output commitment already exists in authoritative UTXO state")]
+    OutputAlreadyExists,
+
+    #[error("invalid range proof at output index {index}")]
+    BadRangeProof { index: usize },
+
+    #[error("kernel locked until height {until}")]
+    KernelLocked { until: u64 },
+
+    #[error("malformed value-balance material")]
+    MalformedValueBalance,
+
+    #[error("MW value equation does not balance")]
+    UnbalancedTransaction,
+
+    #[error("stealth authorization validation failed: {0}")]
+    StealthAuthorization(KernelBoundAuthorizationBundleError),
+}
+
+impl CutThroughBodyV1 {
+    pub fn total_fee(&self) -> u64 {
+        self.kernels
+            .iter()
+            .map(|kernel| kernel.kernel.fee_darks)
+            .sum()
+    }
+
+    pub fn total_reward(&self) -> u64 {
+        self.kernels
+            .iter()
+            .map(|kernel| kernel.kernel.reward_darks)
+            .sum()
+    }
+}
+
+impl LedgerState {
+    /// Validate a v3 cut-through transfer candidate against authoritative
+    /// ledger state without mutating the state.
+    ///
+    /// Checks performed here:
+    ///
+    /// 1. canonical candidate shape/encoding
+    /// 2. no coinbase material in the transfer path
+    /// 3. kernel lock heights
+    /// 4. output range proofs and UTXO collisions
+    /// 5. authoritative input lookup and coinbase maturity
+    /// 6. input authorization against state-derived canonical Ko
+    /// 7. ordinary Mimblewimble value balance
+    /// 8. Ks/Ki/Ko/E'/x' stealth balance
+    /// 9. every retained E' is bound to its concrete kernel
+    ///
+    /// This method does NOT mutate the UTXO set, kernel accumulator, supply,
+    /// height or transaction counter.
+    pub fn check_cutthrough_v1_acceptable(
+        &self,
+        tx: &CutThroughTransactionV1,
+        next_height: Height,
+        ctx: &[u8],
+    ) -> Result<(), CutThroughStateError> {
+        tx.check_shape()?;
+
+        // This method models the mempool/ordinary-transfer path.
+        //
+        // Coinbase construction will receive its own explicit v3 path rather
+        // than weakening the transfer rules.
+        if tx
+            .body
+            .kernels
+            .iter()
+            .any(|kernel| kernel.kernel.feature == nightfall_crypto::KernelFeature::Coinbase)
+            || tx
+                .body
+                .outputs
+                .iter()
+                .any(|output| output.output.features.is_coinbase())
+        {
+            return Err(CutThroughStateError::CoinbaseInTransfer);
+        }
+
+        for kernel in &tx.body.kernels {
+            if kernel.kernel.lock_height > next_height.0 {
+                return Err(CutThroughStateError::KernelLocked {
+                    until: kernel.kernel.lock_height,
+                });
+            }
+        }
+
+        // Full output crypto checks.
+        //
+        // check_shape() already verifies both output signatures and point
+        // encodings; range proofs need the network proof context and therefore
+        // live here.
+        for (index, output) in tx.body.outputs.iter().enumerate() {
+            if !nightfall_crypto::rangeproofs::verify(
+                &output.output.range_proof,
+                &output.output.commit,
+                ctx,
+            ) {
+                return Err(CutThroughStateError::BadRangeProof { index });
+            }
+
+            if self.utxos.contains(&output.output.commit) {
+                return Err(CutThroughStateError::OutputAlreadyExists);
+            }
+        }
+
+        // Resolve Ko ONLY from authoritative UTXO state.
+        let mut canonical_kos = Vec::with_capacity(tx.body.inputs.len());
+
+        for input in &tx.body.inputs {
+            let entry = self.utxos.get(&input.commit).ok_or_else(|| {
+                CutThroughStateError::UnknownInput {
+                    commit: input.commit.to_hex(),
+                }
+            })?;
+
+            if !is_mature(entry, next_height, self.coinbase_maturity) {
+                return Err(CutThroughStateError::ImmatureCoinbaseSpend {
+                    created: entry.height,
+                    now: next_height.0,
+                });
+            }
+
+            canonical_kos.push(entry.output_pk);
+        }
+
+        // Preserve Nightfall's existing inflation-resistance equation.
+        let input_commits: Vec<Commitment> =
+            tx.body.inputs.iter().map(|input| input.commit).collect();
+
+        let output_commits: Vec<Commitment> = tx
+            .body
+            .outputs
+            .iter()
+            .map(|output| output.output.commit)
+            .collect();
+
+        let expected = nightfall_crypto::expected_excess(
+            &input_commits,
+            &output_commits,
+            tx.body.total_fee(),
+            tx.body.total_reward(),
+        )
+        .ok_or(CutThroughStateError::MalformedValueBalance)?;
+
+        let kernel_excesses: Vec<Commitment> = tx
+            .body
+            .kernels
+            .iter()
+            .map(|kernel| kernel.kernel.excess)
+            .collect();
+
+        let kernel_sum =
+            Commitment::sum(&kernel_excesses).ok_or(CutThroughStateError::MalformedValueBalance)?;
+
+        if expected != kernel_sum {
+            return Err(CutThroughStateError::UnbalancedTransaction);
+        }
+
+        // Only kernels actually carrying E' participate in the kernel-bound
+        // stealth bundle. Kernels without E' remain ordinary MW kernels.
+        let mut bindings = Vec::new();
+
+        let mut bound_kernels = Vec::new();
+
+        for kernel in &tx.body.kernels {
+            if let Some(binding) = kernel.stealth_binding {
+                bindings.push(binding);
+                bound_kernels.push(kernel.kernel.clone());
+            }
+        }
+
+        let sender_authorizations = tx
+            .body
+            .outputs
+            .iter()
+            .map(|output| output.sender_authorization)
+            .collect();
+
+        let input_authorizations = tx
+            .body
+            .inputs
+            .iter()
+            .map(|input| input.authorization)
+            .collect();
+
+        let outputs: Vec<nightfall_crypto::Output> = tx
+            .body
+            .outputs
+            .iter()
+            .map(|output| output.output.clone())
+            .collect();
+
+        let bundle = KernelBoundAuthorizationBundleV1 {
+            sender_authorizations,
+            input_authorizations,
+            kernel_bindings: bindings,
+            stealth_offset: tx.body.stealth_offset,
+        };
+
+        bundle
+            .validate(&outputs, &input_commits, &canonical_kos, &bound_kernels)
+            .map_err(CutThroughStateError::StealthAuthorization)?;
+
+        Ok(())
+    }
 }
 
 impl CutThroughTransactionV1 {
@@ -622,5 +852,365 @@ mod tests {
             tx.check_shape(),
             Err(CutThroughV1Error::InvalidSenderAuthorization { index: 0 }),
         );
+    }
+
+    fn stateful_candidate_fixture() -> (LedgerState, CutThroughTransactionV1, Height) {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        let (spent_output, spent_sender_secrets) =
+            create_output(&owner.address(), 10_000, "stateful-input", ctx).expect("spent output");
+
+        let discovered =
+            scan_output(&owner.view_key(), &spent_output).expect("discover spent output");
+
+        let ko_secret = discovered.spend_secret(&owner);
+
+        assert_eq!(
+            (generator_g() * ko_secret).compress().to_bytes(),
+            spent_output.output_pk,
+        );
+
+        let mut state = LedgerState::for_network(NetworkId::Devnet);
+
+        assert!(state.utxos.insert(
+            spent_output.commit,
+            crate::UtxoEntry {
+                output_pk: spent_output.output_pk,
+                height: 0,
+                is_coinbase: false,
+            },
+        ));
+
+        let receiver = WalletKeys::generate();
+
+        let (new_output, new_sender_secrets) =
+            create_output(&receiver.address(), 9_000, "stateful-output", ctx).expect("new output");
+
+        let fee = 1_000u64;
+
+        // Same MW relation used by the active builder:
+        //
+        // Σout - Σin + fee*G = excess*H
+        let kernel_secret = new_sender_secrets.blind - spent_sender_secrets.blind;
+
+        let kernel = build_kernel(KernelFeature::Plain, fee, 0, 0, &kernel_secret);
+
+        assert!(kernel.verify_signature());
+
+        let ki_secret = Scalar::random(&mut OsRng);
+
+        let input_authorization = SpendAuthorizationV1::sign(
+            &spent_output.commit,
+            &ki_secret,
+            &ko_secret,
+            &spent_output.output_pk,
+        )
+        .expect("input authorization");
+
+        let ks_secret = Scalar::random(&mut OsRng);
+
+        let sender_authorization = SenderAuthorizationV1::sign(&new_output, &ks_secret);
+
+        let stealth_excess_secret = Scalar::random(&mut OsRng);
+
+        let stealth_excess = StealthExcessV1::new(Commitment::from_point(
+            generator_g() * stealth_excess_secret,
+        ))
+        .expect("stealth excess");
+
+        let stealth_binding = KernelStealthBindingV1::sign(&kernel, &kernel_secret, stealth_excess)
+            .expect("kernel/E' binding");
+
+        let stealth_offset = crate::stealth_offset_secret(
+            &[ks_secret],
+            &[ki_secret],
+            &[ko_secret],
+            &[stealth_excess_secret],
+        );
+
+        let tx = CutThroughTransactionV1::new(CutThroughBodyV1 {
+            inputs: vec![CutThroughInputV1 {
+                commit: spent_output.commit,
+
+                authorization: input_authorization,
+            }],
+
+            outputs: vec![CutThroughOutputV1 {
+                output: new_output,
+
+                sender_authorization,
+            }],
+
+            kernels: vec![CutThroughKernelV1 {
+                kernel,
+
+                stealth_binding: Some(stealth_binding),
+            }],
+
+            stealth_offset: StealthOffsetV1::from_scalar(&stealth_offset),
+        });
+
+        (state, tx, Height(1))
+    }
+
+    #[test]
+    fn stateful_candidate_validates_against_real_utxo_state() {
+        let (state, tx, next_height) = stateful_candidate_fixture();
+
+        assert_eq!(
+            state.check_cutthrough_v1_acceptable(
+                &tx,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn stateful_candidate_uses_authoritative_ko() {
+        let (mut state, tx, next_height) = stateful_candidate_fixture();
+
+        let input_commit = tx.body.inputs[0].commit;
+
+        let replacement_secret = Scalar::random(&mut OsRng);
+
+        state
+            .utxos
+            .entries
+            .get_mut(&input_commit.0)
+            .expect("UTXO")
+            .output_pk = (generator_g() * replacement_secret).compress().to_bytes();
+
+        assert!(matches!(
+            state.check_cutthrough_v1_acceptable(
+                &tx,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Err(CutThroughStateError::StealthAuthorization(
+                crate::KernelBoundAuthorizationBundleError::Authorization(
+                    crate::AuthorizationBundleError::InvalidInputAuthorization { index: 0 }
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn stateful_candidate_rejects_unknown_input() {
+        let (mut state, tx, next_height) = stateful_candidate_fixture();
+
+        let commit = tx.body.inputs[0].commit;
+
+        state.utxos.remove(&commit);
+
+        assert!(matches!(
+            state.check_cutthrough_v1_acceptable(
+                &tx,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Err(CutThroughStateError::UnknownInput { .. })
+        ));
+    }
+
+    #[test]
+    fn stateful_candidate_preserves_coinbase_maturity() {
+        let (mut state, tx, _next_height) = stateful_candidate_fixture();
+
+        let commit = tx.body.inputs[0].commit;
+
+        let entry = state.utxos.entries.get_mut(&commit.0).expect("UTXO");
+
+        entry.is_coinbase = true;
+        entry.height = 5;
+
+        assert_eq!(
+            state
+                .check_cutthrough_v1_acceptable(&tx, Height(6), NetworkId::Devnet.proof_context(),),
+            Err(CutThroughStateError::ImmatureCoinbaseSpend { created: 5, now: 6 }),
+        );
+    }
+
+    #[test]
+    fn stateful_candidate_verifies_rangeproofs() {
+        let (state, mut tx, next_height) = stateful_candidate_fixture();
+
+        assert!(!tx.body.outputs[0].output.range_proof.0.is_empty());
+
+        tx.body.outputs[0].output.range_proof.0[0] ^= 1;
+
+        // Existing output signature covers the range proof as well, so shape
+        // validation may reject first. Either outcome is fail-closed.
+        assert!(state
+            .check_cutthrough_v1_acceptable(&tx, next_height, NetworkId::Devnet.proof_context(),)
+            .is_err());
+    }
+
+    #[test]
+    fn stateful_candidate_rejects_mw_value_imbalance() {
+        let (state, mut tx, next_height) = stateful_candidate_fixture();
+
+        let old_binding = tx.body.kernels[0].stealth_binding.expect("binding");
+
+        let wrong_kernel_secret = Scalar::random(&mut OsRng);
+
+        let wrong_kernel = build_kernel(KernelFeature::Plain, 1_000, 0, 0, &wrong_kernel_secret);
+
+        let rebound = KernelStealthBindingV1::sign(
+            &wrong_kernel,
+            &wrong_kernel_secret,
+            old_binding.stealth_excess,
+        )
+        .expect("rebound E'");
+
+        tx.body.kernels[0] = CutThroughKernelV1 {
+            kernel: wrong_kernel,
+            stealth_binding: Some(rebound),
+        };
+
+        tx.body.canonicalise();
+
+        assert_eq!(
+            state.check_cutthrough_v1_acceptable(
+                &tx,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Err(CutThroughStateError::UnbalancedTransaction),
+        );
+    }
+
+    #[test]
+    fn stateful_candidate_rejects_stealth_imbalance() {
+        let (state, mut tx, next_height) = stateful_candidate_fixture();
+
+        let old = tx.body.stealth_offset.scalar().expect("canonical");
+
+        tx.body.stealth_offset = StealthOffsetV1::from_scalar(&(old + Scalar::ONE));
+
+        assert!(matches!(
+            state.check_cutthrough_v1_acceptable(
+                &tx,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Err(CutThroughStateError::StealthAuthorization(
+                crate::KernelBoundAuthorizationBundleError::Authorization(
+                    crate::AuthorizationBundleError::StealthBalanceMismatch
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn stateful_candidate_rejects_output_collision() {
+        let (mut state, tx, next_height) = stateful_candidate_fixture();
+
+        let commit = tx.body.outputs[0].output.commit;
+
+        state.utxos.insert(
+            commit,
+            crate::UtxoEntry {
+                output_pk: tx.body.outputs[0].output.output_pk,
+
+                height: 0,
+                is_coinbase: false,
+            },
+        );
+
+        assert_eq!(
+            state.check_cutthrough_v1_acceptable(
+                &tx,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Err(CutThroughStateError::OutputAlreadyExists),
+        );
+    }
+
+    #[test]
+    fn stateful_candidate_rejects_future_kernel_lock() {
+        let (state, mut tx, next_height) = stateful_candidate_fixture();
+
+        let old_kernel = tx.body.kernels[0].kernel.clone();
+
+        let old_binding = tx.body.kernels[0].stealth_binding.expect("binding");
+
+        // We cannot mutate a signed kernel field and retain validity.
+        // Rebuild one with the same E' but a future lock height.
+        //
+        // Its value balance secret is deliberately unrelated here because
+        // lock-height rejection must happen first.
+        let secret = Scalar::random(&mut OsRng);
+
+        let locked_kernel = build_kernel(
+            KernelFeature::Plain,
+            old_kernel.fee_darks,
+            0,
+            next_height.0 + 10,
+            &secret,
+        );
+
+        let binding =
+            KernelStealthBindingV1::sign(&locked_kernel, &secret, old_binding.stealth_excess)
+                .expect("locked binding");
+
+        tx.body.kernels[0] = CutThroughKernelV1 {
+            kernel: locked_kernel,
+            stealth_binding: Some(binding),
+        };
+
+        tx.body.canonicalise();
+
+        assert_eq!(
+            state.check_cutthrough_v1_acceptable(
+                &tx,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Err(CutThroughStateError::KernelLocked {
+                until: next_height.0 + 10,
+            }),
+        );
+    }
+
+    #[test]
+    fn stateful_validation_never_mutates_ledger_state() {
+        let (state, mut tx, next_height) = stateful_candidate_fixture();
+
+        let root_before = state.utxo_root();
+
+        let kernel_before = state.kernel_sum();
+
+        let height_before = state.height;
+
+        let tx_count_before = state.tx_count;
+
+        let minted_before = state.supply.total_minted_darks;
+
+        let burned_before = state.supply.total_burned_darks;
+
+        let old = tx.body.stealth_offset.scalar().expect("canonical");
+
+        tx.body.stealth_offset = StealthOffsetV1::from_scalar(&(old + Scalar::ONE));
+
+        assert!(state
+            .check_cutthrough_v1_acceptable(&tx, next_height, NetworkId::Devnet.proof_context(),)
+            .is_err());
+
+        assert_eq!(state.utxo_root(), root_before,);
+
+        assert_eq!(state.kernel_sum(), kernel_before,);
+
+        assert_eq!(state.height, height_before,);
+
+        assert_eq!(state.tx_count, tx_count_before,);
+
+        assert_eq!(state.supply.total_minted_darks, minted_before,);
+
+        assert_eq!(state.supply.total_burned_darks, burned_before,);
     }
 }
