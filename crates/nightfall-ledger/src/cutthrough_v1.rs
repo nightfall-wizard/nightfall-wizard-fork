@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use curve25519_dalek::{ristretto::CompressedRistretto, scalar::Scalar};
 use nightfall_crypto::{hash_multi, Commitment, Output, TxKernel};
 use nightfall_types::{Hash256, Height};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -137,6 +138,373 @@ pub enum CutThroughV1Error {
 
     #[error("body is not canonically ordered")]
     NonCanonicalBody,
+}
+
+/// Failure while constructing a v3 cut-through transfer candidate.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CutThroughBuildError {
+    #[error("no inputs selected")]
+    NoInputs,
+
+    #[error("too many inputs")]
+    TooManyInputs,
+
+    #[error("too many outputs")]
+    TooManyOutputs,
+
+    #[error("amount arithmetic overflow")]
+    AmountOverflow,
+
+    #[error("insufficient funds: have {have} darks, need {need}")]
+    InsufficientFunds { have: u64, need: u64 },
+
+    #[error("could not construct output")]
+    OutputFailed,
+
+    #[error("spendable commitment does not match value/blind at index {index}")]
+    SpendableCommitmentMismatch { index: usize },
+
+    #[error("could not construct input authorization at index {index}")]
+    InputAuthorizationFailed { index: usize },
+
+    #[error("could not construct stealth excess")]
+    StealthExcessFailed,
+
+    #[error("could not bind stealth excess to kernel")]
+    KernelBindingFailed,
+
+    #[error("builder produced an invalid MW value equation")]
+    InternalValueBalanceMismatch,
+
+    #[error(transparent)]
+    Candidate(#[from] CutThroughV1Error),
+
+    #[error(transparent)]
+    Authorization(#[from] KernelBoundAuthorizationBundleError),
+}
+
+/// Build a complete v3 cut-through transfer candidate.
+///
+/// This is deliberately separate from the active v2 builder.
+///
+/// In addition to the ordinary Nightfall MW transfer it constructs:
+///
+/// * fresh `Ki` for every input
+/// * independent `Ks` for every output
+/// * one transaction stealth excess `E'`
+/// * a value-kernel/E' binding
+/// * aggregate stealth offset `x'`
+///
+/// The resulting candidate is internally checked before being returned.
+///
+/// This remains prototype-only and is NOT consensus-active.
+pub fn build_cutthrough_transfer_v1(
+    _owner: &nightfall_crypto::WalletKeys,
+    spendables: &[crate::Spendable],
+    payments: &[crate::Payment],
+    fee_darks: u64,
+    change_to: &nightfall_crypto::Address,
+    lock_height: u64,
+    ctx: &[u8],
+) -> Result<CutThroughTransactionV1, CutThroughBuildError> {
+    if spendables.is_empty() {
+        return Err(CutThroughBuildError::NoInputs);
+    }
+
+    if spendables.len() > MAX_INPUTS {
+        return Err(CutThroughBuildError::TooManyInputs);
+    }
+
+    let output_count = payments
+        .len()
+        .checked_add(1)
+        .ok_or(CutThroughBuildError::AmountOverflow)?;
+
+    if output_count > MAX_OUTPUTS {
+        return Err(CutThroughBuildError::TooManyOutputs);
+    }
+
+    let input_value = spendables
+        .iter()
+        .try_fold(0u64, |sum, spendable| sum.checked_add(spendable.value))
+        .ok_or(CutThroughBuildError::AmountOverflow)?;
+
+    let payment_value = payments
+        .iter()
+        .try_fold(0u64, |sum, payment| sum.checked_add(payment.amount))
+        .ok_or(CutThroughBuildError::AmountOverflow)?;
+
+    let required = payment_value
+        .checked_add(fee_darks)
+        .ok_or(CutThroughBuildError::AmountOverflow)?;
+
+    if input_value < required {
+        return Err(CutThroughBuildError::InsufficientFunds {
+            have: input_value,
+            need: required,
+        });
+    }
+
+    let change = input_value - required;
+
+    // Validate wallet-supplied commitment openings before using their
+    // blinding factors in the MW excess calculation.
+    for (index, spendable) in spendables.iter().enumerate() {
+        if Commitment::new(spendable.value, &spendable.blind) != spendable.commit {
+            return Err(CutThroughBuildError::SpendableCommitmentMismatch { index });
+        }
+    }
+
+    // -------------------------------------------------
+    // Outputs + independent Ks.
+    // -------------------------------------------------
+
+    let mut outputs = Vec::with_capacity(output_count);
+
+    let mut sender_secrets = Vec::with_capacity(output_count);
+
+    let mut output_blind_sum = Scalar::ZERO;
+
+    for payment in payments {
+        let (output, secrets) =
+            nightfall_crypto::create_output(&payment.to, payment.amount, &payment.memo, ctx)
+                .map_err(|_| CutThroughBuildError::OutputFailed)?;
+
+        output_blind_sum += secrets.blind;
+
+        let ks = Scalar::random(&mut OsRng);
+
+        let sender_authorization = SenderAuthorizationV1::sign(&output, &ks);
+
+        sender_secrets.push(ks);
+
+        outputs.push(CutThroughOutputV1 {
+            output,
+            sender_authorization,
+        });
+    }
+
+    // Match the existing builder's privacy behaviour:
+    // always produce change, including zero-valued change.
+    let (change_output, change_secrets) =
+        nightfall_crypto::create_output(change_to, change, "", ctx)
+            .map_err(|_| CutThroughBuildError::OutputFailed)?;
+
+    output_blind_sum += change_secrets.blind;
+
+    let change_ks = Scalar::random(&mut OsRng);
+
+    let change_sender_authorization = SenderAuthorizationV1::sign(&change_output, &change_ks);
+
+    sender_secrets.push(change_ks);
+
+    outputs.push(CutThroughOutputV1 {
+        output: change_output,
+
+        sender_authorization: change_sender_authorization,
+    });
+
+    // -------------------------------------------------
+    // Inputs + fresh Ki.
+    // -------------------------------------------------
+
+    let mut inputs = Vec::with_capacity(spendables.len());
+
+    let mut input_ephemeral_secrets = Vec::with_capacity(spendables.len());
+
+    let mut spent_output_secrets = Vec::with_capacity(spendables.len());
+
+    // canonicalise() can reorder the input vector.
+    // Retain Ko keyed by commitment so the self-check can reconstruct
+    // authoritative ordering afterwards.
+    let mut ko_by_commit = std::collections::BTreeMap::<[u8; 32], [u8; 32]>::new();
+
+    for (index, spendable) in spendables.iter().enumerate() {
+        let ko_secret = spendable.spend_secret;
+
+        let canonical_ko = (nightfall_crypto::generator_g() * ko_secret)
+            .compress()
+            .to_bytes();
+
+        let ki_secret = Scalar::random(&mut OsRng);
+
+        let authorization =
+            SpendAuthorizationV1::sign(&spendable.commit, &ki_secret, &ko_secret, &canonical_ko)
+                .ok_or(CutThroughBuildError::InputAuthorizationFailed { index })?;
+
+        ko_by_commit.insert(spendable.commit.0, canonical_ko);
+
+        input_ephemeral_secrets.push(ki_secret);
+
+        spent_output_secrets.push(ko_secret);
+
+        inputs.push(CutThroughInputV1 {
+            commit: spendable.commit,
+
+            authorization,
+        });
+    }
+
+    // -------------------------------------------------
+    // Ordinary Nightfall MW value kernel.
+    // -------------------------------------------------
+
+    let input_blind_sum = spendables
+        .iter()
+        .fold(Scalar::ZERO, |sum, spendable| sum + spendable.blind);
+
+    // Σout − Σin + fee·G = excess·H
+    let kernel_secret = output_blind_sum - input_blind_sum;
+
+    let kernel = nightfall_crypto::build_kernel(
+        nightfall_crypto::KernelFeature::Plain,
+        fee_darks,
+        0,
+        lock_height,
+        &kernel_secret,
+    );
+
+    // -------------------------------------------------
+    // E' + explicit kernel binding.
+    // -------------------------------------------------
+
+    let stealth_excess_secret = Scalar::random(&mut OsRng);
+
+    let stealth_excess = crate::StealthExcessV1::new(Commitment::from_point(
+        nightfall_crypto::generator_g() * stealth_excess_secret,
+    ))
+    .ok_or(CutThroughBuildError::StealthExcessFailed)?;
+
+    let kernel_binding = KernelStealthBindingV1::sign(&kernel, &kernel_secret, stealth_excess)
+        .ok_or(CutThroughBuildError::KernelBindingFailed)?;
+
+    // -------------------------------------------------
+    // Aggregate stealth offset.
+    // -------------------------------------------------
+
+    let stealth_offset = crate::stealth_offset_secret(
+        &sender_secrets,
+        &input_ephemeral_secrets,
+        &spent_output_secrets,
+        &[stealth_excess_secret],
+    );
+
+    let tx = CutThroughTransactionV1::new(CutThroughBodyV1 {
+        inputs,
+        outputs,
+
+        kernels: vec![CutThroughKernelV1 {
+            kernel,
+
+            stealth_binding: Some(kernel_binding),
+        }],
+
+        stealth_offset: StealthOffsetV1::from_scalar(&stealth_offset),
+    });
+
+    // -------------------------------------------------
+    // Self-check 1: structural candidate validity.
+    // -------------------------------------------------
+
+    tx.check_shape()?;
+
+    // -------------------------------------------------
+    // Self-check 2: ordinary MW value equation.
+    // -------------------------------------------------
+
+    let input_commits: Vec<Commitment> = tx.body.inputs.iter().map(|input| input.commit).collect();
+
+    let output_commits: Vec<Commitment> = tx
+        .body
+        .outputs
+        .iter()
+        .map(|output| output.output.commit)
+        .collect();
+
+    let expected = nightfall_crypto::expected_excess(
+        &input_commits,
+        &output_commits,
+        tx.body.total_fee(),
+        tx.body.total_reward(),
+    )
+    .ok_or(CutThroughBuildError::InternalValueBalanceMismatch)?;
+
+    let kernel_excesses: Vec<Commitment> = tx
+        .body
+        .kernels
+        .iter()
+        .map(|kernel| kernel.kernel.excess)
+        .collect();
+
+    let actual = Commitment::sum(&kernel_excesses)
+        .ok_or(CutThroughBuildError::InternalValueBalanceMismatch)?;
+
+    if expected != actual {
+        return Err(CutThroughBuildError::InternalValueBalanceMismatch);
+    }
+
+    // -------------------------------------------------
+    // Self-check 3: complete cut-through authorization.
+    // -------------------------------------------------
+
+    let canonical_kos: Vec<[u8; 32]> = tx
+        .body
+        .inputs
+        .iter()
+        .map(|input| {
+            *ko_by_commit
+                .get(&input.commit.0)
+                .expect("builder retained Ko for every input")
+        })
+        .collect();
+
+    let sender_authorizations = tx
+        .body
+        .outputs
+        .iter()
+        .map(|output| output.sender_authorization)
+        .collect();
+
+    let input_authorizations = tx
+        .body
+        .inputs
+        .iter()
+        .map(|input| input.authorization)
+        .collect();
+
+    let kernel_bindings = tx
+        .body
+        .kernels
+        .iter()
+        .filter_map(|kernel| kernel.stealth_binding)
+        .collect();
+
+    let bound_kernels = tx
+        .body
+        .kernels
+        .iter()
+        .filter(|kernel| kernel.stealth_binding.is_some())
+        .map(|kernel| kernel.kernel.clone())
+        .collect::<Vec<_>>();
+
+    let raw_outputs = tx
+        .body
+        .outputs
+        .iter()
+        .map(|output| output.output.clone())
+        .collect::<Vec<_>>();
+
+    let bundle = KernelBoundAuthorizationBundleV1 {
+        sender_authorizations,
+        input_authorizations,
+        kernel_bindings,
+
+        stealth_offset: tx.body.stealth_offset,
+    };
+
+    bundle.validate(&raw_outputs, &input_commits, &canonical_kos, &bound_kernels)?;
+
+    Ok(tx)
 }
 
 /// Failure during stateful validation of a v3 cut-through candidate.
@@ -1212,5 +1580,322 @@ mod tests {
         assert_eq!(state.supply.total_minted_darks, minted_before,);
 
         assert_eq!(state.supply.total_burned_darks, burned_before,);
+    }
+
+    fn builder_spendable(
+        owner: &WalletKeys,
+        value: u64,
+        memo: &str,
+        ctx: &[u8],
+    ) -> (nightfall_crypto::Output, crate::Spendable) {
+        let (output, secrets) =
+            create_output(&owner.address(), value, memo, ctx).expect("source output");
+
+        let discovered = scan_output(&owner.view_key(), &output).expect("discover source output");
+
+        let spendable = crate::Spendable {
+            commit: output.commit,
+
+            value,
+
+            blind: secrets.blind,
+
+            spend_secret: discovered.spend_secret(owner),
+        };
+
+        (output, spendable)
+    }
+
+    #[test]
+    fn builder_constructs_state_valid_candidate() {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        let receiver = WalletKeys::generate();
+
+        let (source, spendable) = builder_spendable(&owner, 20_000, "source", ctx);
+
+        let mut state = LedgerState::for_network(NetworkId::Devnet);
+
+        assert!(state.utxos.insert(
+            source.commit,
+            crate::UtxoEntry {
+                output_pk: source.output_pk,
+
+                height: 0,
+
+                is_coinbase: false,
+            },
+        ));
+
+        let payments = vec![crate::Payment {
+            to: receiver.address(),
+
+            amount: 7_000,
+
+            memo: "payment".into(),
+        }];
+
+        let tx = build_cutthrough_transfer_v1(
+            &owner,
+            &[spendable],
+            &payments,
+            1_000,
+            &owner.address(),
+            0,
+            ctx,
+        )
+        .expect("build v3 transfer");
+
+        assert_eq!(tx.version, CUTTHROUGH_TX_VERSION,);
+
+        assert_eq!(tx.body.inputs.len(), 1,);
+
+        assert_eq!(tx.body.outputs.len(), 2,);
+
+        assert_eq!(tx.body.kernels.len(), 1,);
+
+        assert!(tx.body.kernels[0].stealth_binding.is_some());
+
+        assert_eq!(
+            state.check_cutthrough_v1_acceptable(&tx, Height(1), ctx,),
+            Ok(()),
+        );
+
+        let received = tx
+            .body
+            .outputs
+            .iter()
+            .find_map(|output| scan_output(&receiver.view_key(), &output.output))
+            .expect("receiver payment");
+
+        assert_eq!(received.value, 7_000,);
+
+        let change = tx
+            .body
+            .outputs
+            .iter()
+            .filter_map(|output| scan_output(&owner.view_key(), &output.output))
+            .find(|output| output.value == 12_000)
+            .expect("change output");
+
+        assert_eq!(change.value, 12_000,);
+    }
+
+    #[test]
+    fn builder_handles_multiple_inputs_and_outputs() {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        let receiver_a = WalletKeys::generate();
+
+        let receiver_b = WalletKeys::generate();
+
+        let (source_a, spendable_a) = builder_spendable(&owner, 11_000, "a", ctx);
+
+        let (source_b, spendable_b) = builder_spendable(&owner, 14_000, "b", ctx);
+
+        let mut state = LedgerState::for_network(NetworkId::Devnet);
+
+        for source in [&source_a, &source_b] {
+            assert!(state.utxos.insert(
+                source.commit,
+                crate::UtxoEntry {
+                    output_pk: source.output_pk,
+
+                    height: 0,
+
+                    is_coinbase: false,
+                },
+            ));
+        }
+
+        let payments = vec![
+            crate::Payment {
+                to: receiver_a.address(),
+
+                amount: 5_000,
+
+                memo: "A".into(),
+            },
+            crate::Payment {
+                to: receiver_b.address(),
+
+                amount: 8_000,
+
+                memo: "B".into(),
+            },
+        ];
+
+        let tx = build_cutthrough_transfer_v1(
+            &owner,
+            &[spendable_a, spendable_b],
+            &payments,
+            2_000,
+            &owner.address(),
+            0,
+            ctx,
+        )
+        .expect("multi-input v3 transfer");
+
+        assert_eq!(tx.body.inputs.len(), 2,);
+
+        // Two payments + mandatory change.
+        assert_eq!(tx.body.outputs.len(), 3,);
+
+        assert_eq!(
+            state.check_cutthrough_v1_acceptable(&tx, Height(1), ctx,),
+            Ok(()),
+        );
+
+        let a = tx
+            .body
+            .outputs
+            .iter()
+            .find_map(|output| scan_output(&receiver_a.view_key(), &output.output))
+            .expect("receiver A");
+
+        let b = tx
+            .body
+            .outputs
+            .iter()
+            .find_map(|output| scan_output(&receiver_b.view_key(), &output.output))
+            .expect("receiver B");
+
+        assert_eq!(a.value, 5_000);
+
+        assert_eq!(b.value, 8_000);
+
+        // 25,000 - 13,000 - 2,000 = 10,000.
+        let change = tx
+            .body
+            .outputs
+            .iter()
+            .filter_map(|output| scan_output(&owner.view_key(), &output.output))
+            .find(|output| output.value == 10_000)
+            .expect("multi-input change");
+
+        assert_eq!(change.value, 10_000,);
+    }
+
+    #[test]
+    fn builder_rejects_no_inputs() {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        assert_eq!(
+            build_cutthrough_transfer_v1(&owner, &[], &[], 0, &owner.address(), 0, ctx,),
+            Err(CutThroughBuildError::NoInputs),
+        );
+    }
+
+    #[test]
+    fn builder_rejects_insufficient_funds() {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        let receiver = WalletKeys::generate();
+
+        let (_source, spendable) = builder_spendable(&owner, 5_000, "", ctx);
+
+        let payments = vec![crate::Payment {
+            to: receiver.address(),
+
+            amount: 5_000,
+
+            memo: String::new(),
+        }];
+
+        assert_eq!(
+            build_cutthrough_transfer_v1(
+                &owner,
+                &[spendable],
+                &payments,
+                1,
+                &owner.address(),
+                0,
+                ctx,
+            ),
+            Err(CutThroughBuildError::InsufficientFunds {
+                have: 5_000,
+                need: 5_001,
+            }),
+        );
+    }
+
+    #[test]
+    fn builder_rejects_wrong_spendable_blind() {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        let (_source, mut spendable) = builder_spendable(&owner, 10_000, "", ctx);
+
+        spendable.blind += Scalar::ONE;
+
+        assert_eq!(
+            build_cutthrough_transfer_v1(
+                &owner,
+                &[spendable],
+                &[],
+                1_000,
+                &owner.address(),
+                0,
+                ctx,
+            ),
+            Err(CutThroughBuildError::SpendableCommitmentMismatch { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn builder_produces_fresh_authorization_material() {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        let receiver = WalletKeys::generate();
+
+        let (_source, spendable) = builder_spendable(&owner, 10_000, "", ctx);
+
+        let payments = vec![crate::Payment {
+            to: receiver.address(),
+
+            amount: 5_000,
+
+            memo: String::new(),
+        }];
+
+        let first = build_cutthrough_transfer_v1(
+            &owner,
+            &[spendable.clone()],
+            &payments,
+            1_000,
+            &owner.address(),
+            0,
+            ctx,
+        )
+        .expect("first build");
+
+        let second = build_cutthrough_transfer_v1(
+            &owner,
+            &[spendable],
+            &payments,
+            1_000,
+            &owner.address(),
+            0,
+            ctx,
+        )
+        .expect("second build");
+
+        assert_ne!(first.txid(), second.txid(),);
+
+        assert_ne!(
+            first.body.inputs[0].authorization.ki,
+            second.body.inputs[0].authorization.ki,
+        );
     }
 }
