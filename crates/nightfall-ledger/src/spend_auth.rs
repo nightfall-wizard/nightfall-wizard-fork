@@ -34,6 +34,87 @@ use crate::tx::Transaction;
 /// value would be a consensus change.
 pub const INPUT_AUTH_CHALLENGE_DOMAIN: &[u8] = b"nightfall:cutthrough:input-challenge:v1";
 
+/// Domain for the independent sender-authorization proof used by the
+/// cut-through candidate design.
+pub const SENDER_AUTH_DOMAIN: &[u8] = b"nightfall:cutthrough:sender-auth:v1";
+
+/// Independent sender authorization key `Ks`.
+///
+/// Nightfall's existing output `ephemeral_pk` is the key-exchange key `Ke`.
+/// This candidate deliberately does not assume that `Ke` and `Ks` may safely
+/// share the same secret.
+///
+/// This structure is prototype-only and is not part of the active Output wire
+/// format or consensus rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SenderAuthorizationV1 {
+    /// Independent sender public key `Ks = ks*G`.
+    pub key: [u8; 32],
+
+    /// Proof of knowledge of `ks`, bound to the complete output data and Ks.
+    pub signature: SchnorrSig,
+}
+
+impl SenderAuthorizationV1 {
+    /// Construct an independent sender authorization for an existing output.
+    pub fn sign(output: &nightfall_crypto::Output, sender_secret: &Scalar) -> Self {
+        let key = (generator_g() * *sender_secret).compress().to_bytes();
+
+        let msg = sender_authorization_message(output, &key);
+
+        let signature = sig::sign(sender_secret, &generator_g(), &msg);
+
+        Self { key, signature }
+    }
+
+    /// Verify sender knowledge and binding to the complete output.
+    pub fn verify(&self, output: &nightfall_crypto::Output) -> bool {
+        let Some(public) = CompressedRistretto(self.key).decompress() else {
+            return false;
+        };
+
+        let msg = sender_authorization_message(output, &self.key);
+
+        sig::verify(&public, &generator_g(), &msg, &self.signature)
+    }
+
+    /// `Ks || R || s`.
+    pub fn canonical_bytes(&self) -> [u8; 96] {
+        let mut out = [0u8; 96];
+
+        out[..32].copy_from_slice(&self.key);
+        out[32..64].copy_from_slice(&self.signature.r);
+        out[64..96].copy_from_slice(&self.signature.s);
+
+        out
+    }
+}
+
+/// Sender authorization transcript.
+///
+/// The output's existing `commitment_bytes()` already contains:
+///
+/// * feature
+/// * commitment
+/// * Ke
+/// * Ko
+/// * view tag
+/// * range proof
+/// * encrypted payload
+///
+/// Ks itself is appended explicitly, so replacing the sender authorization
+/// key changes the signed transcript.
+pub fn sender_authorization_message(
+    output: &nightfall_crypto::Output,
+    sender_key: &[u8; 32],
+) -> Vec<u8> {
+    let output_bytes = output.commitment_bytes();
+
+    hash_multi(SENDER_AUTH_DOMAIN, &[&output_bytes, sender_key])
+        .0
+        .to_vec()
+}
+
 /// Fixed-size candidate representation of cut-through-compatible input
 /// authorization.
 ///
@@ -760,6 +841,174 @@ mod tests {
         assert!(
             StealthExcessV1::new(Commitment([0xff; 32])).is_none(),
             "malformed compressed point must fail closed",
+        );
+    }
+
+    #[test]
+    fn independent_sender_authorization_verifies() {
+        let receiver = WalletKeys::generate();
+
+        let (output, _) = create_output(
+            &receiver.address(),
+            55_000,
+            "phase2d",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("output");
+
+        let ks = Scalar::random(&mut OsRng);
+
+        let auth = SenderAuthorizationV1::sign(&output, &ks);
+
+        assert!(
+            auth.verify(&output),
+            "independent Ks authorization must verify",
+        );
+
+        assert_eq!(auth.key, (generator_g() * ks).compress().to_bytes(),);
+    }
+
+    #[test]
+    fn sender_authorization_is_bound_to_output() {
+        let receiver = WalletKeys::generate();
+
+        let (output_a, _) = create_output(
+            &receiver.address(),
+            1_000,
+            "a",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("output a");
+
+        let (output_b, _) = create_output(
+            &receiver.address(),
+            1_000,
+            "b",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("output b");
+
+        let ks = Scalar::random(&mut OsRng);
+
+        let auth = SenderAuthorizationV1::sign(&output_a, &ks);
+
+        assert!(auth.verify(&output_a));
+
+        assert!(
+            !auth.verify(&output_b),
+            "sender proof must not move to another output",
+        );
+    }
+
+    #[test]
+    fn sender_key_substitution_breaks_authorization() {
+        let receiver = WalletKeys::generate();
+
+        let (output, _) = create_output(
+            &receiver.address(),
+            2_000,
+            "ks",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("output");
+
+        let ks = Scalar::random(&mut OsRng);
+
+        let auth = SenderAuthorizationV1::sign(&output, &ks);
+
+        let replacement = Scalar::random(&mut OsRng);
+
+        let mut substituted = auth;
+
+        substituted.key = (generator_g() * replacement).compress().to_bytes();
+
+        assert!(
+            !substituted.verify(&output),
+            "changing Ks must invalidate sender authorization",
+        );
+    }
+
+    #[test]
+    fn malformed_sender_key_fails_closed() {
+        let receiver = WalletKeys::generate();
+
+        let (output, _) = create_output(
+            &receiver.address(),
+            3_000,
+            "",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("output");
+
+        let ks = Scalar::random(&mut OsRng);
+
+        let mut auth = SenderAuthorizationV1::sign(&output, &ks);
+
+        auth.key = [0xff; 32];
+
+        assert!(!auth.verify(&output), "malformed Ks must fail closed",);
+    }
+
+    #[test]
+    fn sender_authorization_roundtrips_exactly() {
+        let receiver = WalletKeys::generate();
+
+        let (output, _) = create_output(
+            &receiver.address(),
+            4_000,
+            "",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("output");
+
+        let ks = Scalar::random(&mut OsRng);
+
+        let auth = SenderAuthorizationV1::sign(&output, &ks);
+
+        let canonical = auth.canonical_bytes();
+
+        let encoded = serde_json::to_vec(&auth).expect("serialize sender auth");
+
+        let decoded: SenderAuthorizationV1 =
+            serde_json::from_slice(&encoded).expect("deserialize sender auth");
+
+        assert_eq!(decoded, auth);
+        assert_eq!(decoded.canonical_bytes(), canonical,);
+        assert!(decoded.verify(&output));
+    }
+
+    #[test]
+    fn sender_authorization_key_can_feed_stealth_balance() {
+        let receiver = WalletKeys::generate();
+
+        let (output, _) = create_output(
+            &receiver.address(),
+            5_000,
+            "",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("output");
+
+        let ks = Scalar::random(&mut OsRng);
+        let ki = Scalar::random(&mut OsRng);
+        let ko = Scalar::random(&mut OsRng);
+        let e = Scalar::random(&mut OsRng);
+
+        let sender = SenderAuthorizationV1::sign(&output, &ks);
+
+        assert!(sender.verify(&output));
+
+        let offset = stealth_offset_secret(&[ks], &[ki], &[ko], &[e]);
+
+        let input_keys = [(generator_g() * ki).compress().to_bytes()];
+
+        let spent_keys = [(generator_g() * ko).compress().to_bytes()];
+
+        let excesses = [Commitment::from_point(generator_g() * e)];
+
+        assert!(
+            verify_stealth_balance(&[sender.key], &input_keys, &spent_keys, &excesses, &offset,),
+            "independent Ks must compose with stealth balance",
         );
     }
 }
