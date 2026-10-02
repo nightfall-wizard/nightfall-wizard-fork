@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod checkpoint;
 pub mod codec;
 pub mod dirlock;
 pub use codec::Format;
@@ -276,10 +277,17 @@ impl ChainStore {
         if m.validated_by.is_empty() || m.validated_by != self.install_id() {
             return false;
         }
+        if !self.blocks_path().exists() {
+            return false;
+        }
         let bytes = fs::metadata(self.blocks_path())
             .map(|x| x.len())
             .unwrap_or(0);
-        if m.validated_bytes != bytes || bytes == 0 {
+        if m.validated_bytes != bytes {
+            return false;
+        }
+        let bodyless_pruned = m.pruned && m.first_height > 0 && m.block_count == m.first_height;
+        if bytes == 0 && !bodyless_pruned {
             return false;
         }
         if !m.pruned && m.first_height == 0 {
@@ -534,6 +542,116 @@ impl ChainStore {
         }
         self.save(&chain)?;
         Ok(chain)
+    }
+
+    /// Export authenticated state at the newest checkpoint compiled into this
+    /// binary.
+    ///
+    /// Unlike `export_snapshot`, this is not a block archive. It contains the
+    /// full header chain through the checkpoint, the checkpoint UTXO state and
+    /// only historical bodies needed to authenticate still-relevant coinbase
+    /// maturity metadata.
+    pub fn export_checkpoint_snapshot(
+        &self,
+        out: &Path,
+        network: NetworkId,
+    ) -> anyhow::Result<checkpoint::CheckpointSnapshot> {
+        if out.exists() {
+            anyhow::bail!("refusing to overwrite {}", out.display());
+        }
+
+        let chain = self.load_or_new(network)?;
+        let snapshot = checkpoint::checkpoint_snapshot_from_chain(&chain)?;
+
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let tmp = out.with_extension("tmp");
+        let write_result = (|| -> anyhow::Result<()> {
+            let mut writer = BufWriter::new(File::create(&tmp)?);
+            serde_json::to_writer(&mut writer, &snapshot)?;
+            writer.flush()?;
+            fs::rename(&tmp, out)?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+
+        Ok(snapshot)
+    }
+
+    /// Install authenticated checkpoint state into a fresh chain datadir.
+    ///
+    /// Acceptance is anchored to the checkpoint compiled into this binary.
+    /// Blocks after that checkpoint are subsequently downloaded and validated
+    /// through the ordinary consensus path.
+    pub fn import_checkpoint_snapshot(
+        &self,
+        from: &Path,
+        network: NetworkId,
+    ) -> anyhow::Result<Chain> {
+        const MAX_CHECKPOINT_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+
+        if !from.is_file() {
+            anyhow::bail!("checkpoint snapshot is not a file: {}", from.display());
+        }
+
+        let bytes = fs::metadata(from)?.len();
+        if bytes == 0 {
+            anyhow::bail!("checkpoint snapshot is empty");
+        }
+        if bytes > MAX_CHECKPOINT_SNAPSHOT_BYTES {
+            anyhow::bail!(
+                "checkpoint snapshot is {} bytes; maximum accepted size is {}",
+                bytes,
+                MAX_CHECKPOINT_SNAPSHOT_BYTES
+            );
+        }
+
+        if self.blocks_path().exists()
+            || self.meta_path().exists()
+            || self.horizon_path().exists()
+            || self.headers_path().exists()
+        {
+            anyhow::bail!(
+                "checkpoint state import requires fresh chain state; refusing to replace existing chain files"
+            );
+        }
+
+        let reader = BufReader::new(File::open(from)?);
+        let snapshot: checkpoint::CheckpointSnapshot = serde_json::from_reader(reader)
+            .map_err(|e| anyhow::anyhow!("invalid checkpoint snapshot: {e}"))?;
+
+        let chain = checkpoint::chain_from_checkpoint_snapshot(snapshot, network)?;
+
+        self.ensure_dir()?;
+        self.save(&chain)?;
+
+        /*
+         * Exercise the exact normal restart path immediately. This proves that
+         * the authenticated in-memory state can be represented safely by the
+         * existing bodyless-pruned persistence format.
+         */
+        let loaded = self.load_or_new(network)?;
+
+        if loaded.tip_hash() != chain.tip_hash()
+            || loaded.ledger.utxo_root() != chain.ledger.utxo_root()
+            || loaded.ledger.kernel_sum() != chain.ledger.kernel_sum()
+            || loaded.ledger.supply.total_minted_darks != chain.ledger.supply.total_minted_darks
+            || loaded.ledger.supply.total_burned_darks != chain.ledger.supply.total_burned_darks
+            || loaded.total_work != chain.total_work
+            || loaded.first_height != chain.first_height
+        {
+            anyhow::bail!("checkpoint state changed after persistence round-trip");
+        }
+
+        Ok(loaded)
     }
 
     /// Tip hash recorded alongside the stored blocks, if any.
