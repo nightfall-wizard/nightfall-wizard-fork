@@ -8,7 +8,7 @@ use nightfall_consensus::Block;
 use nightfall_crypto::{
     scan_candidate, scan_output, Address, Commitment, ScanCandidate, WalletKeys,
 };
-use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction};
+use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction, MAX_INPUTS};
 use nightfall_storage::write_secret_file;
 use nightfall_types::{Amount, NetworkId};
 use serde::{Deserialize, Serialize};
@@ -1517,19 +1517,30 @@ impl Wallet {
         // Largest first, so a payment consumes as few outputs as it can.
         available.sort_by_key(|o| std::cmp::Reverse(o.value));
 
+        let available_total = available
+            .iter()
+            .fold(0u64, |sum, o| sum.saturating_add(o.value));
+
         let mut chosen = Vec::new();
         let mut total = 0u64;
-        for o in available {
+        for o in available.into_iter().take(MAX_INPUTS) {
             if total >= target {
                 break;
             }
             total = total.saturating_add(o.value);
             chosen.push(o.to_spendable(&self.keys)?);
         }
+
         if total < target {
+            if available_total >= target {
+                bail!(
+                    "payment needs more than {} inputs: spendable balance is fragmented;                      consolidate outputs or send a smaller amount",
+                    MAX_INPUTS
+                );
+            }
             bail!(
                 "insufficient funds: have {}, need {}",
-                Amount(total),
+                Amount(available_total),
                 Amount(target)
             );
         }
@@ -3021,6 +3032,46 @@ mod tests {
         let picked = w.pick_commit_hexes_at(1, 0, 0).unwrap();
         assert_eq!(picked, vec![commit.to_hex()]);
         fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn coin_selection_refuses_fragmented_balance_over_consensus_input_limit() {
+        let keys = WalletKeys::from_seed([7u8; 32]);
+        let mut wallet = Wallet::in_memory(NetworkId::Devnet, keys, 0);
+
+        for i in 0..=MAX_INPUTS {
+            let blind = Scalar::from((i as u64) + 1);
+            wallet.test_insert_output(OwnedOutput {
+                commit: Commitment::new(1, &blind),
+                value: 1,
+                blind_hex: hex::encode(blind.to_bytes()),
+                key_offset_hex: hex::encode(Scalar::ZERO.to_bytes()),
+                memo: String::new(),
+                height: 0,
+                spent: false,
+                is_coinbase: false,
+            });
+        }
+
+        let at_limit = wallet
+            .select_coins(MAX_INPUTS as u64)
+            .expect("exactly MAX_INPUTS inputs must remain selectable");
+        assert_eq!(at_limit.len(), MAX_INPUTS);
+
+        let err = wallet
+            .select_coins(MAX_INPUTS as u64 + 1)
+            .expect_err("MAX_INPUTS + 1 fragmented inputs must be rejected");
+        let message = err.to_string();
+        let limit_message = format!("more than {} inputs", MAX_INPUTS);
+
+        assert!(
+            message.contains(&limit_message),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("fragmented"),
+            "fragmentation must be explicit: {message}"
+        );
     }
 
     #[test]
