@@ -553,6 +553,17 @@ pub struct CutThroughStateV1 {
     pub undo: BTreeMap<u64, CutThroughUndoRecordV1>,
 }
 
+/// Audit record for one retention/undo pair removed after the
+/// configured cut-through authorization horizon.
+///
+/// `body_hash` identifies the exact historical v3 candidate whose
+/// local authorization and inverse-transition evidence was discarded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedCutThroughHistoryV1 {
+    pub height: u64,
+    pub body_hash: Hash256,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CutThroughApplyError {
     #[error(transparent)]
@@ -620,6 +631,14 @@ pub enum CutThroughApplyError {
 
     #[error("malformed kernel excess during staged commit")]
     MalformedKernelExcess,
+    #[error("retention height {height} crossed the horizon but has no matching undo record")]
+    MissingUndoForPrune { height: u64 },
+
+    #[error("retention/undo body hash mismatch while pruning height {height}")]
+    PruneBodyHashMismatch { height: u64 },
+
+    #[error("attempted to prune current ledger tip {height}")]
+    PruneWouldRemoveTip { height: u64 },
 
     #[error("state arithmetic overflow")]
     ArithmeticOverflow,
@@ -1059,6 +1078,122 @@ impl CutThroughStateV1 {
         *self = staged;
 
         Ok(undo.body_hash)
+    }
+
+    /// Return retention/undo pairs which have crossed the configured
+    /// authorization horizon.
+    ///
+    /// This is a pure query. Nothing is removed.
+    ///
+    /// A retained authorization record is considered locally prunable only
+    /// when its matching undo record still exists and both identify the same
+    /// v3 body.
+    pub fn prunable_history(&self) -> Result<Vec<PrunedCutThroughHistoryV1>, CutThroughApplyError> {
+        self.validate()?;
+
+        let tip = self.ledger.height;
+
+        let heights = self.retention.prunable_heights(tip);
+
+        let mut result = Vec::with_capacity(heights.len());
+
+        for height in heights {
+            // Defensive check. The retention policy should already prevent
+            // the current tip from becoming prunable.
+            if height == tip.0 {
+                return Err(CutThroughApplyError::PruneWouldRemoveTip { height });
+            }
+
+            let retained = self
+                .retention
+                .blocks()
+                .get(&height)
+                .expect("prunable height originated from retention state");
+
+            let undo = self
+                .undo
+                .get(&height)
+                .ok_or(CutThroughApplyError::MissingUndoForPrune { height })?;
+
+            if retained.body_hash != undo.body_hash {
+                return Err(CutThroughApplyError::PruneBodyHashMismatch { height });
+            }
+
+            result.push(PrunedCutThroughHistoryV1 {
+                height,
+
+                body_hash: retained.body_hash,
+            });
+        }
+
+        Ok(result)
+    }
+
+    /// Atomically remove authorization-retention and undo material after
+    /// the configured horizon has been crossed.
+    ///
+    /// Retention and undo form one logical historical object:
+    ///
+    /// * neither side is removed early;
+    /// * neither side is removed independently;
+    /// * current-tip rollback data is never removed;
+    /// * inconsistencies fail before externally visible mutation.
+    ///
+    /// Once history has been pruned, a reorg deeper than the retained
+    /// horizon must be recovered by replay/resync from older trusted chain
+    /// data rather than reconstructed from missing local undo evidence.
+    pub fn prune_finalized_history(
+        &mut self,
+    ) -> Result<Vec<PrunedCutThroughHistoryV1>, CutThroughApplyError> {
+        let prunable = self.prunable_history()?;
+
+        if prunable.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut staged_retention = self.retention.clone();
+
+        let mut staged_undo = self.undo.clone();
+
+        for item in &prunable {
+            if item.height == self.ledger.height.0 {
+                return Err(CutThroughApplyError::PruneWouldRemoveTip {
+                    height: item.height,
+                });
+            }
+
+            let retained = staged_retention
+                .blocks
+                .remove(&item.height)
+                .expect("validated prunable retention record exists");
+
+            let undo = staged_undo.remove(&item.height).ok_or(
+                CutThroughApplyError::MissingUndoForPrune {
+                    height: item.height,
+                },
+            )?;
+
+            if retained.body_hash != item.body_hash || undo.body_hash != item.body_hash {
+                return Err(CutThroughApplyError::PruneBodyHashMismatch {
+                    height: item.height,
+                });
+            }
+        }
+
+        let staged = Self {
+            ledger: self.ledger.clone(),
+
+            retention: staged_retention,
+
+            undo: staged_undo,
+        };
+
+        staged.validate()?;
+
+        // Only externally visible mutation.
+        *self = staged;
+
+        Ok(prunable)
     }
 }
 
@@ -1972,5 +2107,185 @@ mod tests {
         assert_eq!(state.ledger.verify_supply(), Ok(()),);
 
         state.validate().expect("fully restored state");
+    }
+
+    #[test]
+    fn pruning_never_happens_before_horizon() {
+        let (mut state, tx_a, tx_b, _, _, _) = two_block_rollback_fixture();
+
+        state
+            .apply_transfer(&tx_a, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply A");
+
+        state
+            .apply_transfer(&tx_b, Height(2), NetworkId::Devnet.proof_context())
+            .expect("apply B");
+
+        // Fixture horizon is 10 blocks.
+        assert!(state.prunable_history().expect("prunable query").is_empty());
+
+        assert!(state.prune_finalized_history().expect("prune").is_empty());
+
+        assert_eq!(state.retention.len(), 2,);
+
+        assert_eq!(state.undo.len(), 2,);
+
+        assert!(state.retention.blocks().contains_key(&1));
+
+        assert!(state.retention.blocks().contains_key(&2));
+
+        assert!(state.undo.contains_key(&1));
+
+        assert!(state.undo.contains_key(&2));
+    }
+
+    #[test]
+    fn pruning_removes_only_finalized_retention_undo_pairs() {
+        let (mut state, tx_a, tx_b, _, _, _) = two_block_rollback_fixture();
+
+        // h = 1:
+        //
+        // at tip 2, height 1 has crossed the horizon,
+        // while the current tip at height 2 must remain.
+        state.retention.policy = CutThroughRetentionPolicyV1::new(1).expect("policy");
+
+        state
+            .apply_transfer(&tx_a, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply A");
+
+        state
+            .apply_transfer(&tx_b, Height(2), NetworkId::Devnet.proof_context())
+            .expect("apply B");
+
+        let expected = vec![PrunedCutThroughHistoryV1 {
+            height: 1,
+
+            body_hash: tx_a.body.hash(),
+        }];
+
+        assert_eq!(state.prunable_history().expect("query"), expected,);
+
+        let pruned = state.prune_finalized_history().expect("prune");
+
+        assert_eq!(pruned, expected,);
+
+        assert!(!state.retention.blocks().contains_key(&1));
+
+        assert!(!state.undo.contains_key(&1));
+
+        assert!(state.retention.blocks().contains_key(&2));
+
+        assert!(state.undo.contains_key(&2));
+
+        assert_eq!(state.retention.len(), 1,);
+
+        assert_eq!(state.undo.len(), 1,);
+
+        state.validate().expect("post-prune state");
+
+        // Idempotent at an unchanged tip.
+        assert!(state
+            .prune_finalized_history()
+            .expect("second prune")
+            .is_empty());
+    }
+
+    #[test]
+    fn pruning_preserves_current_tip_rollback() {
+        let (mut state, tx_a, tx_b, _, _, _) = two_block_rollback_fixture();
+
+        state.retention.policy = CutThroughRetentionPolicyV1::new(1).expect("policy");
+
+        state
+            .apply_transfer(&tx_a, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply A");
+
+        let height1_root = state.ledger.utxo_root();
+
+        let height1_kernel = state.ledger.kernel_sum();
+
+        let height1_burned = state.ledger.supply.total_burned_darks;
+
+        state
+            .apply_transfer(&tx_b, Height(2), NetworkId::Devnet.proof_context())
+            .expect("apply B");
+
+        state.prune_finalized_history().expect("prune finalized A");
+
+        assert!(!state.undo.contains_key(&1));
+
+        assert!(state.undo.contains_key(&2));
+
+        assert_eq!(
+            state.rollback_tip().expect("rollback current tip"),
+            tx_b.body.hash(),
+        );
+
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert_eq!(state.ledger.utxo_root(), height1_root,);
+
+        assert_eq!(state.ledger.kernel_sum(), height1_kernel,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, height1_burned,);
+
+        assert!(state.undo.is_empty());
+
+        assert!(state.retention.is_empty());
+
+        // Height 1 itself has already lost local undo evidence.
+        // A deeper rollback must therefore fail closed.
+        assert_eq!(
+            state.rollback_tip(),
+            Err(CutThroughApplyError::NoUndoAtTip { height: 1 }),
+        );
+
+        assert_eq!(state.ledger.verify_supply(), Ok(()),);
+    }
+
+    #[test]
+    fn pruning_fails_closed_when_retention_has_no_matching_undo() {
+        let (mut state, tx_a, tx_b, _, _, _) = two_block_rollback_fixture();
+
+        state.retention.policy = CutThroughRetentionPolicyV1::new(1).expect("policy");
+
+        state
+            .apply_transfer(&tx_a, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply A");
+
+        state
+            .apply_transfer(&tx_b, Height(2), NetworkId::Devnet.proof_context())
+            .expect("apply B");
+
+        // Simulate incomplete/corrupt local historical state.
+        state.undo.remove(&1).expect("remove old undo");
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_before = state.ledger.kernel_sum();
+
+        let retention_before = state.retention.hash().expect("retention hash");
+
+        let undo_before = state.undo.clone();
+
+        assert_eq!(
+            state.prune_finalized_history(),
+            Err(CutThroughApplyError::MissingUndoForPrune { height: 1 }),
+        );
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_before,);
+
+        assert_eq!(
+            state.retention.hash().expect("retention unchanged"),
+            retention_before,
+        );
+
+        assert_eq!(state.undo, undo_before,);
+
+        assert!(state.retention.blocks().contains_key(&1));
+
+        assert!(state.retention.blocks().contains_key(&2));
     }
 }
