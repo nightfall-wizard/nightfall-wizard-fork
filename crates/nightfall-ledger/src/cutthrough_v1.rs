@@ -140,6 +140,135 @@ pub enum CutThroughV1Error {
     NonCanonicalBody,
 }
 
+/// Failure while aggregating v3 cut-through candidates.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CutThroughAggregateError {
+    #[error("cannot aggregate an empty transaction set")]
+    EmptyAggregate,
+
+    #[error("aggregate would exceed the input limit")]
+    TooManyInputs,
+
+    #[error("aggregate would exceed the output limit")]
+    TooManyOutputs,
+
+    #[error("aggregate would exceed the kernel limit")]
+    TooManyKernels,
+
+    #[error("child transaction {index} is invalid: {source}")]
+    InvalidChild {
+        index: usize,
+
+        #[source]
+        source: CutThroughV1Error,
+    },
+
+    #[error("constructed aggregate is invalid: {0}")]
+    InvalidAggregate(CutThroughV1Error),
+}
+
+/// Aggregate independently valid v3 candidates into one flat,
+/// canonically ordered candidate.
+///
+/// This intentionally performs NO cut-through/pruning.
+///
+/// LIP-style one-sided authorization requires inputs and associated stealth
+/// authorization material to remain available until the configured
+/// proof-of-work retention horizon has passed. Pruning before that point
+/// would remove security-critical evidence.
+///
+/// Aggregation therefore only:
+///
+/// * concatenates inputs
+/// * concatenates outputs
+/// * concatenates kernels/bindings
+/// * adds all stealth offsets modulo the scalar field
+/// * canonicalises the resulting flat body
+///
+/// Transaction grouping is consequently destroyed without prematurely
+/// deleting authorization material.
+pub fn aggregate_cutthrough_v1(
+    txs: &[CutThroughTransactionV1],
+) -> Result<CutThroughTransactionV1, CutThroughAggregateError> {
+    if txs.is_empty() {
+        return Err(CutThroughAggregateError::EmptyAggregate);
+    }
+
+    // Validate every child independently before consuming any material.
+    for (index, tx) in txs.iter().enumerate() {
+        tx.check_shape()
+            .map_err(|source| CutThroughAggregateError::InvalidChild { index, source })?;
+    }
+
+    // Compute all sizes before allocation. This keeps malformed/untrusted
+    // aggregate requests from bypassing the existing consensus limits.
+    let total_inputs = txs
+        .iter()
+        .try_fold(0usize, |total, tx| total.checked_add(tx.body.inputs.len()))
+        .ok_or(CutThroughAggregateError::TooManyInputs)?;
+
+    if total_inputs > MAX_INPUTS {
+        return Err(CutThroughAggregateError::TooManyInputs);
+    }
+
+    let total_outputs = txs
+        .iter()
+        .try_fold(0usize, |total, tx| total.checked_add(tx.body.outputs.len()))
+        .ok_or(CutThroughAggregateError::TooManyOutputs)?;
+
+    if total_outputs > MAX_OUTPUTS {
+        return Err(CutThroughAggregateError::TooManyOutputs);
+    }
+
+    let total_kernels = txs
+        .iter()
+        .try_fold(0usize, |total, tx| total.checked_add(tx.body.kernels.len()))
+        .ok_or(CutThroughAggregateError::TooManyKernels)?;
+
+    if total_kernels > MAX_KERNELS {
+        return Err(CutThroughAggregateError::TooManyKernels);
+    }
+
+    let mut inputs = Vec::with_capacity(total_inputs);
+
+    let mut outputs = Vec::with_capacity(total_outputs);
+
+    let mut kernels = Vec::with_capacity(total_kernels);
+
+    let mut aggregate_stealth_offset = Scalar::ZERO;
+
+    for tx in txs {
+        // check_shape() above already guarantees canonical scalar encoding.
+        let offset = tx
+            .body
+            .stealth_offset
+            .scalar()
+            .expect("validated child has canonical stealth offset");
+
+        aggregate_stealth_offset += offset;
+
+        inputs.extend(tx.body.inputs.iter().cloned());
+
+        outputs.extend(tx.body.outputs.iter().cloned());
+
+        kernels.extend(tx.body.kernels.iter().cloned());
+    }
+
+    let aggregate = CutThroughTransactionV1::new(CutThroughBodyV1 {
+        inputs,
+        outputs,
+        kernels,
+
+        stealth_offset: StealthOffsetV1::from_scalar(&aggregate_stealth_offset),
+    });
+
+    aggregate
+        .check_shape()
+        .map_err(CutThroughAggregateError::InvalidAggregate)?;
+
+    Ok(aggregate)
+}
+
 /// Failure while constructing a v3 cut-through transfer candidate.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CutThroughBuildError {
@@ -1897,5 +2026,201 @@ mod tests {
             first.body.inputs[0].authorization.ki,
             second.body.inputs[0].authorization.ki,
         );
+    }
+
+    fn aggregate_candidate_fixture() -> (LedgerState, Vec<CutThroughTransactionV1>, Height) {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner_a = WalletKeys::generate();
+
+        let owner_b = WalletKeys::generate();
+
+        let receiver_a = WalletKeys::generate();
+
+        let receiver_b = WalletKeys::generate();
+
+        let (source_a, spendable_a) =
+            builder_spendable(&owner_a, 15_000, "aggregate-source-a", ctx);
+
+        let (source_b, spendable_b) =
+            builder_spendable(&owner_b, 18_000, "aggregate-source-b", ctx);
+
+        let mut state = LedgerState::for_network(NetworkId::Devnet);
+
+        assert!(state.utxos.insert(
+            source_a.commit,
+            crate::UtxoEntry {
+                output_pk: source_a.output_pk,
+
+                height: 0,
+
+                is_coinbase: false,
+            },
+        ));
+
+        assert!(state.utxos.insert(
+            source_b.commit,
+            crate::UtxoEntry {
+                output_pk: source_b.output_pk,
+
+                height: 0,
+
+                is_coinbase: false,
+            },
+        ));
+
+        let tx_a = build_cutthrough_transfer_v1(
+            &owner_a,
+            &[spendable_a],
+            &[crate::Payment {
+                to: receiver_a.address(),
+
+                amount: 4_000,
+
+                memo: "aggregate-a".into(),
+            }],
+            1_000,
+            &owner_a.address(),
+            0,
+            ctx,
+        )
+        .expect("build aggregate child A");
+
+        let tx_b = build_cutthrough_transfer_v1(
+            &owner_b,
+            &[spendable_b],
+            &[crate::Payment {
+                to: receiver_b.address(),
+
+                amount: 5_000,
+
+                memo: "aggregate-b".into(),
+            }],
+            2_000,
+            &owner_b.address(),
+            0,
+            ctx,
+        )
+        .expect("build aggregate child B");
+
+        (state, vec![tx_a, tx_b], Height(1))
+    }
+
+    #[test]
+    fn aggregate_combines_candidates_and_validates() {
+        let (state, txs, next_height) = aggregate_candidate_fixture();
+
+        let aggregate = aggregate_cutthrough_v1(&txs).expect("aggregate candidates");
+
+        assert_eq!(aggregate.body.inputs.len(), 2,);
+
+        // Two payments + two change outputs.
+        assert_eq!(aggregate.body.outputs.len(), 4,);
+
+        assert_eq!(aggregate.body.kernels.len(), 2,);
+
+        assert_eq!(aggregate.body.total_fee(), 3_000,);
+
+        assert!(aggregate.body.is_canonical());
+
+        assert_eq!(
+            state.check_cutthrough_v1_acceptable(
+                &aggregate,
+                next_height,
+                NetworkId::Devnet.proof_context(),
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn aggregate_order_does_not_reveal_grouping() {
+        let (_state, txs, _next_height) = aggregate_candidate_fixture();
+
+        let forward =
+            aggregate_cutthrough_v1(&[txs[0].clone(), txs[1].clone()]).expect("forward aggregate");
+
+        let reverse =
+            aggregate_cutthrough_v1(&[txs[1].clone(), txs[0].clone()]).expect("reverse aggregate");
+
+        assert_eq!(forward, reverse,);
+
+        assert_eq!(forward.txid(), reverse.txid(),);
+
+        assert_eq!(forward.body.hash(), reverse.body.hash(),);
+    }
+
+    #[test]
+    fn aggregate_stealth_offset_is_exact_sum() {
+        let (_state, txs, _next_height) = aggregate_candidate_fixture();
+
+        let left = txs[0]
+            .body
+            .stealth_offset
+            .scalar()
+            .expect("left canonical offset");
+
+        let right = txs[1]
+            .body
+            .stealth_offset
+            .scalar()
+            .expect("right canonical offset");
+
+        let aggregate = aggregate_cutthrough_v1(&txs).expect("aggregate");
+
+        assert_eq!(aggregate.body.stealth_offset.scalar(), Some(left + right),);
+    }
+
+    #[test]
+    fn aggregate_rejects_empty_set() {
+        assert_eq!(
+            aggregate_cutthrough_v1(&[]),
+            Err(CutThroughAggregateError::EmptyAggregate),
+        );
+    }
+
+    #[test]
+    fn aggregate_rejects_invalid_child() {
+        let (_state, mut txs, _next_height) = aggregate_candidate_fixture();
+
+        txs[1].version = TX_VERSION;
+
+        assert_eq!(
+            aggregate_cutthrough_v1(&txs),
+            Err(CutThroughAggregateError::InvalidChild {
+                index: 1,
+
+                source: CutThroughV1Error::WrongVersion {
+                    got: TX_VERSION,
+
+                    expected: CUTTHROUGH_TX_VERSION,
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn aggregate_rejects_duplicate_transaction_material() {
+        let (_state, txs, _next_height) = aggregate_candidate_fixture();
+
+        let duplicate = txs[0].clone();
+
+        assert_eq!(
+            aggregate_cutthrough_v1(&[duplicate.clone(), duplicate,],),
+            Err(CutThroughAggregateError::InvalidAggregate(
+                CutThroughV1Error::DuplicateInput
+            )),
+        );
+    }
+
+    #[test]
+    fn aggregation_does_not_mutate_sources() {
+        let (_state, txs, _next_height) = aggregate_candidate_fixture();
+
+        let before = txs.clone();
+
+        let _aggregate = aggregate_cutthrough_v1(&txs).expect("aggregate");
+
+        assert_eq!(txs, before,);
     }
 }
