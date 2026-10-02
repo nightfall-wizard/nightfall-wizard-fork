@@ -430,6 +430,243 @@ pub enum CutThroughRetentionError {
     HeightKeyMismatch { key: u64, record: u64 },
 }
 
+/// Prototype state coupling the ordinary Nightfall ledger with
+/// the v3 authorization-retention window.
+///
+/// This remains isolated from the active v2 block path.
+///
+/// `apply_transfer` handles an ordinary v3 transfer only:
+///
+/// * coinbase material remains forbidden;
+/// * fees are burned in this transfer-only prototype;
+/// * canonical Ko is captured before the UTXO disappears;
+/// * ledger and retention mutations occur on staged clones;
+/// * externally visible state changes only after every check succeeds.
+///
+/// Full block/coinbase/fork integration is a later phase.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CutThroughStateV1 {
+    pub ledger: LedgerState,
+
+    pub retention: CutThroughRetentionWindowV1,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CutThroughApplyError {
+    #[error(transparent)]
+    Validation(#[from] crate::CutThroughStateError),
+
+    #[error(transparent)]
+    Retention(#[from] CutThroughRetentionError),
+
+    #[error(transparent)]
+    Supply(#[from] crate::SupplyError),
+
+    #[error("confirmed height {got} is not the next ledger height {expected}")]
+    NonSequentialHeight { got: u64, expected: u64 },
+
+    #[error("retention height {retained} is ahead of ledger height {ledger}")]
+    RetentionAheadOfLedger { retained: u64, ledger: u64 },
+
+    #[error("validated input {commit} disappeared during staged commit")]
+    MissingInputDuringCommit { commit: String },
+
+    #[error("validated output {commit} collided during staged commit")]
+    OutputCollisionDuringCommit { commit: String },
+
+    #[error("malformed kernel excess during staged commit")]
+    MalformedKernelExcess,
+
+    #[error("state arithmetic overflow")]
+    ArithmeticOverflow,
+}
+
+impl CutThroughStateV1 {
+    pub fn new(
+        ledger: LedgerState,
+        retention: CutThroughRetentionWindowV1,
+    ) -> Result<Self, CutThroughApplyError> {
+        let state = Self { ledger, retention };
+
+        state.validate()?;
+
+        Ok(state)
+    }
+
+    /// Validate coupled state after construction, reload or staging.
+    pub fn validate(&self) -> Result<(), CutThroughApplyError> {
+        self.retention.validate()?;
+
+        self.ledger.verify_supply()?;
+
+        if let Some(retained_height) = self.retention.blocks().keys().next_back().copied() {
+            if retained_height > self.ledger.height.0 {
+                return Err(CutThroughApplyError::RetentionAheadOfLedger {
+                    retained: retained_height,
+
+                    ledger: self.ledger.height.0,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Atomically apply one ordinary v3 transfer aggregate.
+    ///
+    /// `self` is never partially mutated. All changes are first applied to
+    /// cloned staged state and committed together only after validation,
+    /// retention capture, accounting and the global supply invariant succeed.
+    pub fn apply_transfer(
+        &mut self,
+        tx: &CutThroughTransactionV1,
+        confirmed_height: Height,
+        ctx: &[u8],
+    ) -> Result<(), CutThroughApplyError> {
+        self.validate()?;
+
+        let expected_height = self
+            .ledger
+            .height
+            .0
+            .checked_add(1)
+            .ok_or(CutThroughApplyError::ArithmeticOverflow)?;
+
+        if confirmed_height.0 != expected_height {
+            return Err(CutThroughApplyError::NonSequentialHeight {
+                got: confirmed_height.0,
+
+                expected: expected_height,
+            });
+        }
+
+        // Complete stateful v3 verification against authoritative state.
+        self.ledger
+            .check_cutthrough_v1_acceptable(tx, confirmed_height, ctx)?;
+
+        // check_shape() is part of the validator above, therefore the
+        // aggregate fee/reward sums are known not to overflow.
+        let fees = tx.body.total_fee();
+
+        let kernel_count = u64::try_from(tx.body.kernels.len())
+            .map_err(|_| CutThroughApplyError::ArithmeticOverflow)?;
+
+        // Pre-flight every counter before any staged mutation.
+        let next_kernel_count = self
+            .ledger
+            .kernels
+            .count
+            .checked_add(kernel_count)
+            .ok_or(CutThroughApplyError::ArithmeticOverflow)?;
+
+        let next_tx_count = self
+            .ledger
+            .tx_count
+            .checked_add(kernel_count)
+            .ok_or(CutThroughApplyError::ArithmeticOverflow)?;
+
+        let next_burned = self
+            .ledger
+            .supply
+            .total_burned_darks
+            .checked_add(fees)
+            .ok_or(CutThroughApplyError::ArithmeticOverflow)?;
+
+        // Capture canonical Ko and spent-output metadata before UTXO removal.
+        let retained = RetainedCutThroughBlockV1::capture(&self.ledger, tx, confirmed_height)?;
+
+        // No mutation of `self` before this point.
+        let mut staged_ledger = self.ledger.clone();
+
+        let mut staged_retention = self.retention.clone();
+
+        // ------------------------------------------------------------
+        // Spend inputs.
+        // ------------------------------------------------------------
+
+        for input in &tx.body.inputs {
+            if staged_ledger.utxos.remove(&input.commit).is_none() {
+                return Err(CutThroughApplyError::MissingInputDuringCommit {
+                    commit: input.commit.to_hex(),
+                });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Create outputs.
+        // ------------------------------------------------------------
+
+        for output in &tx.body.outputs {
+            let inserted = staged_ledger.utxos.insert(
+                output.output.commit,
+                UtxoEntry {
+                    output_pk: output.output.output_pk,
+
+                    height: confirmed_height.0,
+
+                    is_coinbase: output.output.features.is_coinbase(),
+                },
+            );
+
+            if !inserted {
+                return Err(CutThroughApplyError::OutputCollisionDuringCommit {
+                    commit: output.output.commit.to_hex(),
+                });
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Accumulate ordinary MW kernel excesses.
+        //
+        // The pre-flight next_kernel_count check guarantees the internal
+        // per-kernel counter increments cannot overflow.
+        // ------------------------------------------------------------
+
+        for kernel in &tx.body.kernels {
+            staged_ledger
+                .kernels
+                .add(&kernel.kernel.excess)
+                .ok_or(CutThroughApplyError::MalformedKernelExcess)?;
+        }
+
+        if staged_ledger.kernels.count != next_kernel_count {
+            return Err(CutThroughApplyError::ArithmeticOverflow);
+        }
+
+        // Ordinary transfer prototype:
+        //
+        // outputs - inputs + fee*G = kernel_excess
+        //
+        // therefore burning the fee preserves
+        //
+        // UTXO - kernels = circulating*G.
+        staged_ledger.supply.total_burned_darks = next_burned;
+
+        staged_ledger.tx_count = next_tx_count;
+
+        staged_ledger.height = confirmed_height;
+
+        // Global inflation invariant must succeed before commit.
+        staged_ledger.verify_supply()?;
+
+        // Retention insertion is also staged.
+        staged_retention.insert(retained)?;
+
+        let staged = Self {
+            ledger: staged_ledger,
+
+            retention: staged_retention,
+        };
+
+        staged.validate()?;
+
+        // Only externally visible mutation.
+        *self = staged;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,5 +926,283 @@ mod tests {
             first.hash().expect("first hash"),
             second.hash().expect("second hash"),
         );
+    }
+
+    fn atomic_apply_fixture() -> (
+        CutThroughStateV1,
+        CutThroughTransactionV1,
+        Commitment,
+        [u8; 32],
+    ) {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner = WalletKeys::generate();
+
+        let receiver = WalletKeys::generate();
+
+        let (source, source_secrets) =
+            create_output(&owner.address(), 20_000, "atomic-source", ctx).expect("source");
+
+        let discovered = scan_output(&owner.view_key(), &source).expect("discover source");
+
+        let spendable = Spendable {
+            commit: source.commit,
+
+            value: 20_000,
+
+            blind: source_secrets.blind,
+
+            spend_secret: discovered.spend_secret(&owner),
+        };
+
+        let mut ledger = LedgerState::for_network(NetworkId::Devnet);
+
+        assert!(ledger.utxos.insert(
+            source.commit,
+            UtxoEntry {
+                output_pk: source.output_pk,
+
+                height: 0,
+
+                is_coinbase: false,
+            },
+        ));
+
+        // Establish a cryptographically consistent pre-transfer
+        // supply state:
+        //
+        // UTXO = 20_000*G + blind*H
+        // kernel = blind*H
+        // UTXO - kernel = 20_000*G.
+        let mint_kernel = nightfall_crypto::build_kernel(
+            nightfall_crypto::KernelFeature::Coinbase,
+            0,
+            20_000,
+            0,
+            &source_secrets.blind,
+        );
+
+        ledger
+            .kernels
+            .add(&mint_kernel.excess)
+            .expect("initial kernel excess");
+
+        ledger.supply.total_minted_darks = 20_000;
+
+        ledger.height = Height(0);
+
+        ledger.verify_supply().expect("initial supply invariant");
+
+        let tx = build_cutthrough_transfer_v1(
+            &owner,
+            &[spendable],
+            &[Payment {
+                to: receiver.address(),
+
+                amount: 8_000,
+
+                memo: "atomic-payment".into(),
+            }],
+            1_000,
+            &owner.address(),
+            0,
+            ctx,
+        )
+        .expect("v3 transfer");
+
+        let retention =
+            CutThroughRetentionWindowV1::new(CutThroughRetentionPolicyV1::new(10).expect("policy"))
+                .expect("retention");
+
+        let state = CutThroughStateV1::new(ledger, retention).expect("coupled state");
+
+        (state, tx, source.commit, source.output_pk)
+    }
+
+    #[test]
+    fn atomic_apply_updates_ledger_and_retention_together() {
+        let (mut state, tx, source_commit, source_ko) = atomic_apply_fixture();
+
+        let old_kernel_count = state.ledger.kernels.count;
+
+        state
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context())
+            .expect("atomic apply");
+
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert!(!state.ledger.utxos.contains(&source_commit));
+
+        for output in &tx.body.outputs {
+            let entry = state
+                .ledger
+                .utxos
+                .get(&output.output.commit)
+                .expect("new UTXO");
+
+            assert_eq!(entry.output_pk, output.output.output_pk,);
+
+            assert_eq!(entry.height, 1,);
+
+            assert!(!entry.is_coinbase);
+        }
+
+        assert_eq!(state.ledger.supply.total_minted_darks, 20_000,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, 1_000,);
+
+        assert_eq!(state.ledger.supply.circulating(), 19_000,);
+
+        assert_eq!(state.ledger.tx_count, tx.body.kernels.len() as u64,);
+
+        assert_eq!(
+            state.ledger.kernels.count,
+            old_kernel_count + tx.body.kernels.len() as u64,
+        );
+
+        state
+            .ledger
+            .verify_supply()
+            .expect("post-apply supply invariant");
+
+        assert_eq!(state.retention.len(), 1,);
+
+        let retained = state
+            .retention
+            .blocks()
+            .get(&1)
+            .expect("height-1 retention");
+
+        assert_eq!(retained.body_hash, tx.body.hash(),);
+
+        assert_eq!(retained.inputs.len(), 1,);
+
+        assert_eq!(retained.inputs[0].commit, source_commit,);
+
+        assert_eq!(retained.inputs[0].canonical_ko, source_ko,);
+
+        assert_eq!(retained.kernel_bindings.len(), 1,);
+
+        state.validate().expect("coupled state valid");
+    }
+
+    #[test]
+    fn atomic_apply_rejects_nonsequential_height_without_mutation() {
+        let (mut state, tx, _, _) = atomic_apply_fixture();
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_before = state.ledger.kernel_sum();
+
+        let retention_before = state.retention.hash().expect("retention hash");
+
+        let tx_count_before = state.ledger.tx_count;
+
+        let burned_before = state.ledger.supply.total_burned_darks;
+
+        assert_eq!(
+            state.apply_transfer(&tx, Height(2), NetworkId::Devnet.proof_context(),),
+            Err(CutThroughApplyError::NonSequentialHeight {
+                got: 2,
+                expected: 1,
+            }),
+        );
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_before,);
+
+        assert_eq!(state.ledger.tx_count, tx_count_before,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, burned_before,);
+
+        assert_eq!(
+            state.retention.hash().expect("unchanged retention"),
+            retention_before,
+        );
+
+        assert_eq!(state.ledger.height, Height(0),);
+    }
+
+    #[test]
+    fn failed_validation_mutates_neither_ledger_nor_retention() {
+        let (mut state, mut tx, source_commit, _) = atomic_apply_fixture();
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_before = state.ledger.kernel_sum();
+
+        let tx_count_before = state.ledger.tx_count;
+
+        let burned_before = state.ledger.supply.total_burned_darks;
+
+        let retention_before = state.retention.hash().expect("retention hash");
+
+        let old = tx.body.stealth_offset.scalar().expect("canonical offset");
+
+        tx.body.stealth_offset =
+            crate::StealthOffsetV1::from_scalar(&(old + curve25519_dalek::scalar::Scalar::ONE));
+
+        assert!(state
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context(),)
+            .is_err());
+
+        assert!(state.ledger.utxos.contains(&source_commit));
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_before,);
+
+        assert_eq!(state.ledger.tx_count, tx_count_before,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, burned_before,);
+
+        assert_eq!(
+            state.retention.hash().expect("unchanged retention"),
+            retention_before,
+        );
+
+        assert_eq!(state.ledger.height, Height(0),);
+    }
+
+    #[test]
+    fn coupled_state_rejects_retention_ahead_of_ledger() {
+        let (mut state, tx, _, _) = atomic_apply_fixture();
+
+        let record = RetainedCutThroughBlockV1::capture(&state.ledger, &tx, Height(5))
+            .expect("future retention record");
+
+        state
+            .retention
+            .insert(record)
+            .expect("structurally valid retention");
+
+        assert_eq!(
+            state.validate(),
+            Err(CutThroughApplyError::RetentionAheadOfLedger {
+                retained: 5,
+                ledger: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn apply_preserves_global_supply_equation_exactly() {
+        let (mut state, tx, _, _) = atomic_apply_fixture();
+
+        state
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply");
+
+        assert_eq!(state.ledger.supply.total_minted_darks, 20_000,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, tx.body.total_fee(),);
+
+        assert_eq!(
+            state.ledger.supply.circulating(),
+            20_000 - tx.body.total_fee(),
+        );
+
+        assert_eq!(state.ledger.verify_supply(), Ok(()),);
     }
 }

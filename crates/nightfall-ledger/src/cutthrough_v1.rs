@@ -100,6 +100,9 @@ pub enum CutThroughV1Error {
     #[error("transaction has no outputs")]
     NoOutputs,
 
+    #[error("kernel fee/reward arithmetic overflow")]
+    KernelAmountOverflow,
+
     #[error("duplicate input commitment")]
     DuplicateInput,
 
@@ -935,6 +938,22 @@ impl CutThroughBodyV1 {
 
         if self.outputs.is_empty() {
             return Err(CutThroughV1Error::NoOutputs);
+        }
+
+        if self
+            .kernels
+            .iter()
+            .try_fold(0u64, |sum, kernel| sum.checked_add(kernel.kernel.fee_darks))
+            .is_none()
+            || self
+                .kernels
+                .iter()
+                .try_fold(0u64, |sum, kernel| {
+                    sum.checked_add(kernel.kernel.reward_darks)
+                })
+                .is_none()
+        {
+            return Err(CutThroughV1Error::KernelAmountOverflow);
         }
 
         if !self.stealth_offset.is_canonical() {
@@ -2222,5 +2241,36 @@ mod tests {
         let _aggregate = aggregate_cutthrough_v1(&txs).expect("aggregate");
 
         assert_eq!(txs, before,);
+    }
+
+    #[test]
+    fn kernel_amount_overflow_fails_closed() {
+        let mut tx = candidate_transaction();
+
+        let first_secret = Scalar::random(&mut OsRng);
+
+        let second_secret = Scalar::random(&mut OsRng);
+
+        let first = build_kernel(KernelFeature::Plain, u64::MAX, 0, 0, &first_secret);
+
+        let second = build_kernel(KernelFeature::Plain, 1, 0, 0, &second_secret);
+
+        tx.body.kernels = vec![
+            CutThroughKernelV1 {
+                kernel: first,
+                stealth_binding: None,
+            },
+            CutThroughKernelV1 {
+                kernel: second,
+                stealth_binding: None,
+            },
+        ];
+
+        tx.body.canonicalise();
+
+        assert_eq!(
+            tx.check_shape(),
+            Err(CutThroughV1Error::KernelAmountOverflow),
+        );
     }
 }
