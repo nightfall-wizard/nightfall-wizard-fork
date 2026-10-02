@@ -430,25 +430,127 @@ pub enum CutThroughRetentionError {
     HeightKeyMismatch { key: u64, record: u64 },
 }
 
+/// One UTXO mutation retained for deterministic rollback.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CutThroughUndoUtxoV1 {
+    pub commit: Commitment,
+    pub entry: UtxoEntry,
+}
+
+/// Complete undo material for one confirmed v3 transfer aggregate.
+///
+/// The record stores both the authoritative pre-state and the expected
+/// post-state. Rollback therefore fails closed if the live state no longer
+/// matches the state that this undo record was created for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CutThroughUndoRecordV1 {
+    pub height: u64,
+    pub previous_height: u64,
+
+    pub body_hash: Hash256,
+
+    pub previous_utxo_root: Hash256,
+    pub post_utxo_root: Hash256,
+
+    pub previous_kernel_sum: Commitment,
+    pub previous_kernel_count: u64,
+
+    pub post_kernel_sum: Commitment,
+    pub post_kernel_count: u64,
+
+    pub previous_minted_darks: u64,
+    pub previous_burned_darks: u64,
+
+    pub post_minted_darks: u64,
+    pub post_burned_darks: u64,
+
+    pub previous_tx_count: u64,
+    pub post_tx_count: u64,
+
+    pub spent_inputs: Vec<CutThroughUndoUtxoV1>,
+
+    pub created_outputs: Vec<CutThroughUndoUtxoV1>,
+}
+
+impl CutThroughUndoRecordV1 {
+    pub fn validate(&self) -> Result<(), CutThroughApplyError> {
+        if self.previous_height.checked_add(1) != Some(self.height) {
+            return Err(CutThroughApplyError::InvalidUndoRecord {
+                height: self.height,
+            });
+        }
+
+        let kernel_delta = self
+            .post_kernel_count
+            .checked_sub(self.previous_kernel_count)
+            .ok_or(CutThroughApplyError::InvalidUndoRecord {
+                height: self.height,
+            })?;
+
+        let tx_delta = self
+            .post_tx_count
+            .checked_sub(self.previous_tx_count)
+            .ok_or(CutThroughApplyError::InvalidUndoRecord {
+                height: self.height,
+            })?;
+
+        if kernel_delta == 0 || kernel_delta != tx_delta {
+            return Err(CutThroughApplyError::InvalidUndoRecord {
+                height: self.height,
+            });
+        }
+
+        // Transfer-only Phase 4B never mints.
+        if self.previous_minted_darks != self.post_minted_darks
+            || self.post_burned_darks < self.previous_burned_darks
+        {
+            return Err(CutThroughApplyError::InvalidUndoRecord {
+                height: self.height,
+            });
+        }
+
+        let mut seen = BTreeSet::new();
+
+        for spent in &self.spent_inputs {
+            if !seen.insert(spent.commit.0) {
+                return Err(CutThroughApplyError::InvalidUndoRecord {
+                    height: self.height,
+                });
+            }
+        }
+
+        for created in &self.created_outputs {
+            if !seen.insert(created.commit.0) {
+                return Err(CutThroughApplyError::InvalidUndoRecord {
+                    height: self.height,
+                });
+            }
+
+            if created.entry.height != self.height || created.entry.is_coinbase {
+                return Err(CutThroughApplyError::InvalidUndoRecord {
+                    height: self.height,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Prototype state coupling the ordinary Nightfall ledger with
-/// the v3 authorization-retention window.
+/// the v3 authorization-retention window and its reorg undo material.
 ///
 /// This remains isolated from the active v2 block path.
-///
-/// `apply_transfer` handles an ordinary v3 transfer only:
-///
-/// * coinbase material remains forbidden;
-/// * fees are burned in this transfer-only prototype;
-/// * canonical Ko is captured before the UTXO disappears;
-/// * ledger and retention mutations occur on staged clones;
-/// * externally visible state changes only after every check succeeds.
-///
-/// Full block/coinbase/fork integration is a later phase.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CutThroughStateV1 {
     pub ledger: LedgerState,
 
     pub retention: CutThroughRetentionWindowV1,
+
+    /// Reorg material. No entry may be pruned while its block remains inside
+    /// the cut-through authorization horizon.
+    #[serde(default)]
+    pub undo: BTreeMap<u64, CutThroughUndoRecordV1>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -468,11 +570,53 @@ pub enum CutThroughApplyError {
     #[error("retention height {retained} is ahead of ledger height {ledger}")]
     RetentionAheadOfLedger { retained: u64, ledger: u64 },
 
+    #[error("undo map key {key} does not match record height {record}")]
+    UndoHeightKeyMismatch { key: u64, record: u64 },
+
+    #[error("undo height {undo} is ahead of ledger height {ledger}")]
+    UndoAheadOfLedger { undo: u64, ledger: u64 },
+
+    #[error("undo tip {undo} does not match ledger tip {ledger}")]
+    UndoTipMismatch { undo: u64, ledger: u64 },
+
+    #[error("invalid undo record at height {height}")]
+    InvalidUndoRecord { height: u64 },
+
+    #[error("missing retention record for undo height {height}")]
+    MissingRetentionForUndo { height: u64 },
+
+    #[error("undo and retention body hash differ at height {height}")]
+    UndoRetentionMismatch { height: u64 },
+
+    #[error("live state does not match undo post-state at height {height}")]
+    CurrentStateDoesNotMatchUndo { height: u64 },
+
+    #[error("duplicate undo height {height}")]
+    DuplicateUndoHeight { height: u64 },
+
+    #[error("no rollback material exists for ledger tip {height}")]
+    NoUndoAtTip { height: u64 },
+
     #[error("validated input {commit} disappeared during staged commit")]
     MissingInputDuringCommit { commit: String },
 
     #[error("validated output {commit} collided during staged commit")]
     OutputCollisionDuringCommit { commit: String },
+
+    #[error("created output {commit} is missing during rollback")]
+    MissingCreatedOutputDuringRollback { commit: String },
+
+    #[error("created output {commit} metadata changed before rollback")]
+    CreatedOutputMetadataMismatch { commit: String },
+
+    #[error("spent input {commit} already exists during rollback")]
+    RestoredInputCollision { commit: String },
+
+    #[error("retention record disappeared during rollback at height {height}")]
+    RetentionRecordMissingDuringRollback { height: u64 },
+
+    #[error("rollback did not reconstruct the exact pre-state at height {height}")]
+    RollbackStateMismatch { height: u64 },
 
     #[error("malformed kernel excess during staged commit")]
     MalformedKernelExcess,
@@ -486,7 +630,12 @@ impl CutThroughStateV1 {
         ledger: LedgerState,
         retention: CutThroughRetentionWindowV1,
     ) -> Result<Self, CutThroughApplyError> {
-        let state = Self { ledger, retention };
+        let state = Self {
+            ledger,
+            retention,
+
+            undo: BTreeMap::new(),
+        };
 
         state.validate()?;
 
@@ -509,14 +658,65 @@ impl CutThroughStateV1 {
             }
         }
 
+        for (height, undo) in &self.undo {
+            if *height != undo.height {
+                return Err(CutThroughApplyError::UndoHeightKeyMismatch {
+                    key: *height,
+
+                    record: undo.height,
+                });
+            }
+
+            undo.validate()?;
+
+            if *height > self.ledger.height.0 {
+                return Err(CutThroughApplyError::UndoAheadOfLedger {
+                    undo: *height,
+
+                    ledger: self.ledger.height.0,
+                });
+            }
+
+            let retained = self
+                .retention
+                .blocks()
+                .get(height)
+                .ok_or(CutThroughApplyError::MissingRetentionForUndo { height: *height })?;
+
+            if retained.body_hash != undo.body_hash {
+                return Err(CutThroughApplyError::UndoRetentionMismatch { height: *height });
+            }
+        }
+
+        if let Some((undo_height, undo)) = self.undo.iter().next_back() {
+            if *undo_height != self.ledger.height.0 {
+                return Err(CutThroughApplyError::UndoTipMismatch {
+                    undo: *undo_height,
+
+                    ledger: self.ledger.height.0,
+                });
+            }
+
+            if self.ledger.utxo_root() != undo.post_utxo_root
+                || self.ledger.kernels.sum != undo.post_kernel_sum
+                || self.ledger.kernels.count != undo.post_kernel_count
+                || self.ledger.supply.total_minted_darks != undo.post_minted_darks
+                || self.ledger.supply.total_burned_darks != undo.post_burned_darks
+                || self.ledger.tx_count != undo.post_tx_count
+            {
+                return Err(CutThroughApplyError::CurrentStateDoesNotMatchUndo {
+                    height: undo.height,
+                });
+            }
+        }
+
         Ok(())
     }
 
     /// Atomically apply one ordinary v3 transfer aggregate.
     ///
-    /// `self` is never partially mutated. All changes are first applied to
-    /// cloned staged state and committed together only after validation,
-    /// retention capture, accounting and the global supply invariant succeed.
+    /// `self` is never partially mutated. The exact inverse transition is
+    /// retained together with the authorization horizon record.
     pub fn apply_transfer(
         &mut self,
         tx: &CutThroughTransactionV1,
@@ -540,18 +740,20 @@ impl CutThroughStateV1 {
             });
         }
 
-        // Complete stateful v3 verification against authoritative state.
+        if self.undo.contains_key(&confirmed_height.0) {
+            return Err(CutThroughApplyError::DuplicateUndoHeight {
+                height: confirmed_height.0,
+            });
+        }
+
         self.ledger
             .check_cutthrough_v1_acceptable(tx, confirmed_height, ctx)?;
 
-        // check_shape() is part of the validator above, therefore the
-        // aggregate fee/reward sums are known not to overflow.
         let fees = tx.body.total_fee();
 
         let kernel_count = u64::try_from(tx.body.kernels.len())
             .map_err(|_| CutThroughApplyError::ArithmeticOverflow)?;
 
-        // Pre-flight every counter before any staged mutation.
         let next_kernel_count = self
             .ledger
             .kernels
@@ -572,17 +774,41 @@ impl CutThroughStateV1 {
             .checked_add(fees)
             .ok_or(CutThroughApplyError::ArithmeticOverflow)?;
 
-        // Capture canonical Ko and spent-output metadata before UTXO removal.
+        // Capture canonical Ko and original UTXO metadata BEFORE spending.
         let retained = RetainedCutThroughBlockV1::capture(&self.ledger, tx, confirmed_height)?;
+
+        let spent_inputs = retained
+            .inputs
+            .iter()
+            .map(|input| CutThroughUndoUtxoV1 {
+                commit: input.commit,
+
+                entry: input.restored_utxo_entry(),
+            })
+            .collect::<Vec<_>>();
+
+        let previous_height = self.ledger.height.0;
+
+        let previous_utxo_root = self.ledger.utxo_root();
+
+        let previous_kernel_sum = self.ledger.kernels.sum;
+
+        let previous_kernel_count = self.ledger.kernels.count;
+
+        let previous_minted_darks = self.ledger.supply.total_minted_darks;
+
+        let previous_burned_darks = self.ledger.supply.total_burned_darks;
+
+        let previous_tx_count = self.ledger.tx_count;
+
+        let body_hash = retained.body_hash;
 
         // No mutation of `self` before this point.
         let mut staged_ledger = self.ledger.clone();
 
         let mut staged_retention = self.retention.clone();
 
-        // ------------------------------------------------------------
-        // Spend inputs.
-        // ------------------------------------------------------------
+        let mut staged_undo = self.undo.clone();
 
         for input in &tx.body.inputs {
             if staged_ledger.utxos.remove(&input.commit).is_none() {
@@ -591,10 +817,6 @@ impl CutThroughStateV1 {
                 });
             }
         }
-
-        // ------------------------------------------------------------
-        // Create outputs.
-        // ------------------------------------------------------------
 
         for output in &tx.body.outputs {
             let inserted = staged_ledger.utxos.insert(
@@ -615,13 +837,6 @@ impl CutThroughStateV1 {
             }
         }
 
-        // ------------------------------------------------------------
-        // Accumulate ordinary MW kernel excesses.
-        //
-        // The pre-flight next_kernel_count check guarantees the internal
-        // per-kernel counter increments cannot overflow.
-        // ------------------------------------------------------------
-
         for kernel in &tx.body.kernels {
             staged_ledger
                 .kernels
@@ -633,37 +848,217 @@ impl CutThroughStateV1 {
             return Err(CutThroughApplyError::ArithmeticOverflow);
         }
 
-        // Ordinary transfer prototype:
-        //
-        // outputs - inputs + fee*G = kernel_excess
-        //
-        // therefore burning the fee preserves
-        //
-        // UTXO - kernels = circulating*G.
         staged_ledger.supply.total_burned_darks = next_burned;
 
         staged_ledger.tx_count = next_tx_count;
 
         staged_ledger.height = confirmed_height;
 
-        // Global inflation invariant must succeed before commit.
         staged_ledger.verify_supply()?;
 
-        // Retention insertion is also staged.
+        let created_outputs = tx
+            .body
+            .outputs
+            .iter()
+            .map(|output| CutThroughUndoUtxoV1 {
+                commit: output.output.commit,
+
+                entry: UtxoEntry {
+                    output_pk: output.output.output_pk,
+
+                    height: confirmed_height.0,
+
+                    is_coinbase: false,
+                },
+            })
+            .collect::<Vec<_>>();
+
         staged_retention.insert(retained)?;
+
+        let undo = CutThroughUndoRecordV1 {
+            height: confirmed_height.0,
+
+            previous_height,
+
+            body_hash,
+
+            previous_utxo_root,
+
+            post_utxo_root: staged_ledger.utxo_root(),
+
+            previous_kernel_sum,
+
+            previous_kernel_count,
+
+            post_kernel_sum: staged_ledger.kernels.sum,
+
+            post_kernel_count: staged_ledger.kernels.count,
+
+            previous_minted_darks,
+
+            previous_burned_darks,
+
+            post_minted_darks: staged_ledger.supply.total_minted_darks,
+
+            post_burned_darks: staged_ledger.supply.total_burned_darks,
+
+            previous_tx_count,
+
+            post_tx_count: staged_ledger.tx_count,
+
+            spent_inputs,
+
+            created_outputs,
+        };
+
+        undo.validate()?;
+
+        if staged_undo.insert(confirmed_height.0, undo).is_some() {
+            return Err(CutThroughApplyError::DuplicateUndoHeight {
+                height: confirmed_height.0,
+            });
+        }
 
         let staged = Self {
             ledger: staged_ledger,
 
             retention: staged_retention,
+
+            undo: staged_undo,
         };
 
         staged.validate()?;
 
-        // Only externally visible mutation.
         *self = staged;
 
         Ok(())
+    }
+
+    /// Roll back exactly the current v3 ledger tip.
+    ///
+    /// Rollback is intentionally tip-only. Reorgs deeper than one block call
+    /// this repeatedly, newest block first. Nothing is mutated unless the
+    /// current state exactly matches the retained post-state.
+    pub fn rollback_tip(&mut self) -> Result<Hash256, CutThroughApplyError> {
+        self.validate()?;
+
+        let tip = self.ledger.height.0;
+
+        let undo = self
+            .undo
+            .get(&tip)
+            .cloned()
+            .ok_or(CutThroughApplyError::NoUndoAtTip { height: tip })?;
+
+        undo.validate()?;
+
+        let retained = self
+            .retention
+            .blocks()
+            .get(&tip)
+            .ok_or(CutThroughApplyError::MissingRetentionForUndo { height: tip })?;
+
+        if retained.body_hash != undo.body_hash {
+            return Err(CutThroughApplyError::UndoRetentionMismatch { height: tip });
+        }
+
+        let mut staged_ledger = self.ledger.clone();
+
+        let mut staged_retention = self.retention.clone();
+
+        let mut staged_undo = self.undo.clone();
+
+        // Remove outputs created by the orphaned tip.
+        for created in &undo.created_outputs {
+            let current = staged_ledger
+                .utxos
+                .get(&created.commit)
+                .cloned()
+                .ok_or_else(
+                    || CutThroughApplyError::MissingCreatedOutputDuringRollback {
+                        commit: created.commit.to_hex(),
+                    },
+                )?;
+
+            if current != created.entry {
+                return Err(CutThroughApplyError::CreatedOutputMetadataMismatch {
+                    commit: created.commit.to_hex(),
+                });
+            }
+
+            staged_ledger.utxos.remove(&created.commit).ok_or_else(|| {
+                CutThroughApplyError::MissingCreatedOutputDuringRollback {
+                    commit: created.commit.to_hex(),
+                }
+            })?;
+        }
+
+        // Restore the exact UTXO metadata consumed by the orphaned tip.
+        for spent in &undo.spent_inputs {
+            if !staged_ledger
+                .utxos
+                .insert(spent.commit, spent.entry.clone())
+            {
+                return Err(CutThroughApplyError::RestoredInputCollision {
+                    commit: spent.commit.to_hex(),
+                });
+            }
+        }
+
+        // KernelAccumulator has an append-only active API. For the isolated
+        // v3 prototype we restore the exact trusted pre-state snapshot rather
+        // than changing the active v2 accumulator interface.
+        staged_ledger.kernels.sum = undo.previous_kernel_sum;
+
+        staged_ledger.kernels.count = undo.previous_kernel_count;
+
+        staged_ledger.supply.total_minted_darks = undo.previous_minted_darks;
+
+        staged_ledger.supply.total_burned_darks = undo.previous_burned_darks;
+
+        staged_ledger.tx_count = undo.previous_tx_count;
+
+        staged_ledger.height = Height(undo.previous_height);
+
+        let removed_retention = staged_retention
+            .blocks
+            .remove(&tip)
+            .ok_or(CutThroughApplyError::RetentionRecordMissingDuringRollback { height: tip })?;
+
+        if removed_retention.body_hash != undo.body_hash {
+            return Err(CutThroughApplyError::UndoRetentionMismatch { height: tip });
+        }
+
+        if staged_undo.remove(&tip).is_none() {
+            return Err(CutThroughApplyError::NoUndoAtTip { height: tip });
+        }
+
+        if staged_ledger.utxo_root() != undo.previous_utxo_root
+            || staged_ledger.kernels.sum != undo.previous_kernel_sum
+            || staged_ledger.kernels.count != undo.previous_kernel_count
+            || staged_ledger.supply.total_minted_darks != undo.previous_minted_darks
+            || staged_ledger.supply.total_burned_darks != undo.previous_burned_darks
+            || staged_ledger.tx_count != undo.previous_tx_count
+            || staged_ledger.height.0 != undo.previous_height
+        {
+            return Err(CutThroughApplyError::RollbackStateMismatch { height: tip });
+        }
+
+        staged_ledger.verify_supply()?;
+
+        let staged = Self {
+            ledger: staged_ledger,
+
+            retention: staged_retention,
+
+            undo: staged_undo,
+        };
+
+        staged.validate()?;
+
+        *self = staged;
+
+        Ok(undo.body_hash)
     }
 }
 
@@ -1204,5 +1599,378 @@ mod tests {
         );
 
         assert_eq!(state.ledger.verify_supply(), Ok(()),);
+    }
+
+    #[test]
+    fn rollback_restores_exact_preapply_state() {
+        let (mut state, tx, source_commit, source_ko) = atomic_apply_fixture();
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_sum_before = state.ledger.kernel_sum();
+
+        let kernel_count_before = state.ledger.kernels.count;
+
+        let minted_before = state.ledger.supply.total_minted_darks;
+
+        let burned_before = state.ledger.supply.total_burned_darks;
+
+        let tx_count_before = state.ledger.tx_count;
+
+        let height_before = state.ledger.height;
+
+        let retention_before = state.retention.hash().expect("retention hash");
+
+        let source_before = state
+            .ledger
+            .utxos
+            .get(&source_commit)
+            .expect("source")
+            .clone();
+
+        state
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply");
+
+        assert_eq!(state.undo.len(), 1,);
+
+        assert!(!state.ledger.utxos.contains(&source_commit));
+
+        let rolled_back = state.rollback_tip().expect("rollback");
+
+        assert_eq!(rolled_back, tx.body.hash(),);
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_sum_before,);
+
+        assert_eq!(state.ledger.kernels.count, kernel_count_before,);
+
+        assert_eq!(state.ledger.supply.total_minted_darks, minted_before,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, burned_before,);
+
+        assert_eq!(state.ledger.tx_count, tx_count_before,);
+
+        assert_eq!(state.ledger.height, height_before,);
+
+        assert_eq!(
+            state.retention.hash().expect("restored retention"),
+            retention_before,
+        );
+
+        assert!(state.undo.is_empty());
+
+        let restored = state
+            .ledger
+            .utxos
+            .get(&source_commit)
+            .expect("restored source");
+
+        assert_eq!(restored, &source_before,);
+
+        assert_eq!(restored.output_pk, source_ko,);
+
+        for output in &tx.body.outputs {
+            assert!(!state.ledger.utxos.contains(&output.output.commit));
+        }
+
+        assert_eq!(state.ledger.verify_supply(), Ok(()),);
+
+        state.validate().expect("restored state valid");
+    }
+
+    #[test]
+    fn rollback_without_undo_is_atomic() {
+        let (mut state, _tx, _, _) = atomic_apply_fixture();
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_before = state.ledger.kernel_sum();
+
+        let retention_before = state.retention.hash().expect("retention");
+
+        assert_eq!(
+            state.rollback_tip(),
+            Err(CutThroughApplyError::NoUndoAtTip { height: 0 }),
+        );
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_before,);
+
+        assert_eq!(state.retention.hash().expect("unchanged"), retention_before,);
+
+        assert_eq!(state.ledger.height, Height(0),);
+    }
+
+    #[test]
+    fn rollback_detects_post_state_tampering() {
+        let (mut state, tx, _, _) = atomic_apply_fixture();
+
+        state
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply");
+
+        state.ledger.tx_count += 1;
+
+        let tampered_count = state.ledger.tx_count;
+
+        assert_eq!(
+            state.rollback_tip(),
+            Err(CutThroughApplyError::CurrentStateDoesNotMatchUndo { height: 1 }),
+        );
+
+        assert_eq!(state.ledger.tx_count, tampered_count,);
+
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert_eq!(state.undo.len(), 1,);
+
+        assert_eq!(state.retention.len(), 1,);
+    }
+
+    #[test]
+    fn undo_and_retention_body_hash_must_match() {
+        let (mut state, tx, _, _) = atomic_apply_fixture();
+
+        state
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply");
+
+        state.undo.get_mut(&1).expect("undo").body_hash = Hash256::ZERO;
+
+        assert_eq!(
+            state.validate(),
+            Err(CutThroughApplyError::UndoRetentionMismatch { height: 1 }),
+        );
+    }
+
+    fn two_block_rollback_fixture() -> (
+        CutThroughStateV1,
+        CutThroughTransactionV1,
+        CutThroughTransactionV1,
+        Hash256,
+        Commitment,
+        Commitment,
+    ) {
+        let ctx = NetworkId::Devnet.proof_context();
+
+        let owner_a = WalletKeys::generate();
+
+        let owner_b = WalletKeys::generate();
+
+        let receiver_a = WalletKeys::generate();
+
+        let receiver_b = WalletKeys::generate();
+
+        let (source_a, secrets_a) =
+            create_output(&owner_a.address(), 18_000, "reorg-source-a", ctx).expect("source A");
+
+        let (source_b, secrets_b) =
+            create_output(&owner_b.address(), 22_000, "reorg-source-b", ctx).expect("source B");
+
+        let discovered_a = scan_output(&owner_a.view_key(), &source_a).expect("discover A");
+
+        let discovered_b = scan_output(&owner_b.view_key(), &source_b).expect("discover B");
+
+        let spendable_a = Spendable {
+            commit: source_a.commit,
+
+            value: 18_000,
+
+            blind: secrets_a.blind,
+
+            spend_secret: discovered_a.spend_secret(&owner_a),
+        };
+
+        let spendable_b = Spendable {
+            commit: source_b.commit,
+
+            value: 22_000,
+
+            blind: secrets_b.blind,
+
+            spend_secret: discovered_b.spend_secret(&owner_b),
+        };
+
+        let mut ledger = LedgerState::for_network(NetworkId::Devnet);
+
+        assert!(ledger.utxos.insert(
+            source_a.commit,
+            UtxoEntry {
+                output_pk: source_a.output_pk,
+
+                height: 0,
+
+                is_coinbase: false,
+            },
+        ));
+
+        assert!(ledger.utxos.insert(
+            source_b.commit,
+            UtxoEntry {
+                output_pk: source_b.output_pk,
+
+                height: 0,
+
+                is_coinbase: false,
+            },
+        ));
+
+        let mint_a = nightfall_crypto::build_kernel(
+            nightfall_crypto::KernelFeature::Coinbase,
+            0,
+            18_000,
+            0,
+            &secrets_a.blind,
+        );
+
+        let mint_b = nightfall_crypto::build_kernel(
+            nightfall_crypto::KernelFeature::Coinbase,
+            0,
+            22_000,
+            0,
+            &secrets_b.blind,
+        );
+
+        ledger.kernels.add(&mint_a.excess).expect("mint A");
+
+        ledger.kernels.add(&mint_b.excess).expect("mint B");
+
+        ledger.supply.total_minted_darks = 40_000;
+
+        ledger.height = Height(0);
+
+        ledger.verify_supply().expect("initial supply");
+
+        let initial_root = ledger.utxo_root();
+
+        let tx_a = build_cutthrough_transfer_v1(
+            &owner_a,
+            &[spendable_a],
+            &[Payment {
+                to: receiver_a.address(),
+
+                amount: 6_000,
+
+                memo: "reorg-A".into(),
+            }],
+            1_000,
+            &owner_a.address(),
+            0,
+            ctx,
+        )
+        .expect("tx A");
+
+        let tx_b = build_cutthrough_transfer_v1(
+            &owner_b,
+            &[spendable_b],
+            &[Payment {
+                to: receiver_b.address(),
+
+                amount: 7_000,
+
+                memo: "reorg-B".into(),
+            }],
+            2_000,
+            &owner_b.address(),
+            0,
+            ctx,
+        )
+        .expect("tx B");
+
+        let retention =
+            CutThroughRetentionWindowV1::new(CutThroughRetentionPolicyV1::new(10).expect("policy"))
+                .expect("retention");
+
+        let state = CutThroughStateV1::new(ledger, retention).expect("state");
+
+        (
+            state,
+            tx_a,
+            tx_b,
+            initial_root,
+            source_a.commit,
+            source_b.commit,
+        )
+    }
+
+    #[test]
+    fn multiple_apply_and_rollback_restores_each_tip_in_order() {
+        let (mut state, tx_a, tx_b, initial_root, source_a, source_b) =
+            two_block_rollback_fixture();
+
+        let initial_kernel_sum = state.ledger.kernel_sum();
+
+        let initial_kernel_count = state.ledger.kernels.count;
+
+        state
+            .apply_transfer(&tx_a, Height(1), NetworkId::Devnet.proof_context())
+            .expect("apply A");
+
+        let height1_root = state.ledger.utxo_root();
+
+        let height1_kernel_sum = state.ledger.kernel_sum();
+
+        let height1_kernel_count = state.ledger.kernels.count;
+
+        assert_eq!(state.ledger.supply.total_burned_darks, 1_000,);
+
+        state
+            .apply_transfer(&tx_b, Height(2), NetworkId::Devnet.proof_context())
+            .expect("apply B");
+
+        assert_eq!(state.ledger.height, Height(2),);
+
+        assert_eq!(state.undo.len(), 2,);
+
+        assert_eq!(state.retention.len(), 2,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, 3_000,);
+
+        assert_eq!(state.rollback_tip().expect("rollback B"), tx_b.body.hash(),);
+
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert_eq!(state.ledger.utxo_root(), height1_root,);
+
+        assert_eq!(state.ledger.kernel_sum(), height1_kernel_sum,);
+
+        assert_eq!(state.ledger.kernels.count, height1_kernel_count,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, 1_000,);
+
+        assert_eq!(state.undo.len(), 1,);
+
+        assert_eq!(state.retention.len(), 1,);
+
+        assert!(state.ledger.utxos.contains(&source_b));
+
+        assert_eq!(state.rollback_tip().expect("rollback A"), tx_a.body.hash(),);
+
+        assert_eq!(state.ledger.height, Height(0),);
+
+        assert_eq!(state.ledger.utxo_root(), initial_root,);
+
+        assert_eq!(state.ledger.kernel_sum(), initial_kernel_sum,);
+
+        assert_eq!(state.ledger.kernels.count, initial_kernel_count,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, 0,);
+
+        assert_eq!(state.ledger.supply.total_minted_darks, 40_000,);
+
+        assert!(state.ledger.utxos.contains(&source_a));
+
+        assert!(state.ledger.utxos.contains(&source_b));
+
+        assert!(state.undo.is_empty());
+
+        assert!(state.retention.is_empty());
+
+        assert_eq!(state.ledger.verify_supply(), Ok(()),);
+
+        state.validate().expect("fully restored state");
     }
 }
