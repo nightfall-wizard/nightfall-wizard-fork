@@ -26,6 +26,8 @@ use nightfall_crypto::{generator_g, hash_multi, sig, Commitment, SchnorrSig};
 
 use serde::{Deserialize, Serialize};
 
+use nightfall_crypto::{generator_h, TxKernel};
+
 use crate::tx::Transaction;
 
 /// Domain separator for the candidate cut-through input authorization.
@@ -225,6 +227,127 @@ impl StealthOffsetV1 {
     pub fn canonical_bytes(&self) -> [u8; 32] {
         self.bytes
     }
+}
+
+/// Domain separator for binding a Nightfall value kernel to one stealth
+/// excess `E'`.
+pub const KERNEL_STEALTH_BIND_DOMAIN: &[u8] = b"nightfall:cutthrough:kernel-stealth-bind:v1";
+
+/// Prototype proof that a specific Nightfall value kernel authorizes a
+/// specific stealth excess `E'`.
+///
+/// Nightfall's value kernel excess is a discrete log with respect to `H`,
+/// whereas stealth keys and `E'` live with respect to `G`. Therefore this
+/// prototype does not assume that the two points can be collapsed into one
+/// ordinary Schnorr verification key.
+///
+/// Instead, the holder of the existing kernel excess secret explicitly signs
+/// the complete existing kernel plus `E'` under generator `H`.
+///
+/// This is not consensus-active yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelStealthBindingV1 {
+    /// The exact stealth excess authorized by this kernel.
+    pub stealth_excess: StealthExcessV1,
+
+    /// Proof under the kernel excess key, using generator H.
+    pub signature: SchnorrSig,
+}
+
+impl KernelStealthBindingV1 {
+    /// Construct a binding only when `kernel_excess_secret` really opens the
+    /// canonical kernel excess and both the existing kernel and E' are valid.
+    pub fn sign(
+        kernel: &TxKernel,
+        kernel_excess_secret: &Scalar,
+        stealth_excess: StealthExcessV1,
+    ) -> Option<Self> {
+        if !stealth_excess.is_well_formed() {
+            return None;
+        }
+
+        if kernel.check_shape().is_err() || !kernel.verify_signature() {
+            return None;
+        }
+
+        let kernel_excess_point = kernel.excess.point()?;
+
+        if generator_h() * *kernel_excess_secret != kernel_excess_point {
+            return None;
+        }
+
+        let msg = kernel_stealth_binding_message(kernel, &stealth_excess);
+
+        let signature = sig::sign(kernel_excess_secret, &generator_h(), &msg);
+
+        Some(Self {
+            stealth_excess,
+            signature,
+        })
+    }
+
+    /// Verify the existing value kernel and its authorization of E'.
+    pub fn verify(&self, kernel: &TxKernel) -> bool {
+        if !self.stealth_excess.is_well_formed() {
+            return false;
+        }
+
+        if kernel.check_shape().is_err() || !kernel.verify_signature() {
+            return false;
+        }
+
+        let Some(kernel_excess_point) = kernel.excess.point() else {
+            return false;
+        };
+
+        let msg = kernel_stealth_binding_message(kernel, &self.stealth_excess);
+
+        sig::verify(&kernel_excess_point, &generator_h(), &msg, &self.signature)
+    }
+
+    /// Fixed representation: `E' || R || s`.
+    pub fn canonical_bytes(&self) -> [u8; 96] {
+        let mut out = [0u8; 96];
+
+        out[..32].copy_from_slice(&self.stealth_excess.point.0);
+        out[32..64].copy_from_slice(&self.signature.r);
+        out[64..96].copy_from_slice(&self.signature.s);
+
+        out
+    }
+}
+
+/// Canonical transcript binding the entire current Nightfall kernel object to
+/// one stealth excess.
+///
+/// `TxKernel::signing_message()` already binds:
+///
+/// * feature
+/// * fee
+/// * reward
+/// * lock height
+/// * value excess E
+///
+/// The existing kernel signature bytes are included too, so this proof binds
+/// the concrete kernel rather than merely another object with identical
+/// unsigned fields.
+pub fn kernel_stealth_binding_message(
+    kernel: &TxKernel,
+    stealth_excess: &StealthExcessV1,
+) -> Vec<u8> {
+    let kernel_message = kernel.signing_message();
+
+    hash_multi(
+        KERNEL_STEALTH_BIND_DOMAIN,
+        &[
+            &kernel_message,
+            &kernel.excess_sig.r,
+            &kernel.excess_sig.s,
+            &stealth_excess.point.0,
+        ],
+    )
+    .0
+    .to_vec()
 }
 
 /// Prototype container joining all cut-through authorization material.
@@ -1421,5 +1544,140 @@ mod tests {
         assert_eq!(decoded, bundle);
 
         assert_eq!(decoded.validate(&outputs, &commits, &kos,), Ok(()),);
+    }
+
+    fn kernel_stealth_fixture() -> (TxKernel, Scalar, StealthExcessV1) {
+        let kernel_secret = Scalar::random(&mut OsRng);
+
+        let kernel = nightfall_crypto::build_kernel(
+            nightfall_crypto::KernelFeature::Plain,
+            7,
+            0,
+            0,
+            &kernel_secret,
+        );
+
+        assert!(kernel.verify_signature());
+
+        let stealth_secret = Scalar::random(&mut OsRng);
+
+        let stealth_excess =
+            StealthExcessV1::new(Commitment::from_point(generator_g() * stealth_secret))
+                .expect("valid stealth excess");
+
+        (kernel, kernel_secret, stealth_excess)
+    }
+
+    #[test]
+    fn kernel_stealth_binding_verifies() {
+        let (kernel, kernel_secret, stealth_excess) = kernel_stealth_fixture();
+
+        let binding = KernelStealthBindingV1::sign(&kernel, &kernel_secret, stealth_excess)
+            .expect("valid binding");
+
+        assert!(
+            binding.verify(&kernel),
+            "kernel must authorize its exact E'",
+        );
+    }
+
+    #[test]
+    fn kernel_stealth_binding_rejects_excess_substitution() {
+        let (kernel, kernel_secret, stealth_excess) = kernel_stealth_fixture();
+
+        let mut binding = KernelStealthBindingV1::sign(&kernel, &kernel_secret, stealth_excess)
+            .expect("valid binding");
+
+        let replacement_secret = Scalar::random(&mut OsRng);
+
+        binding.stealth_excess =
+            StealthExcessV1::new(Commitment::from_point(generator_g() * replacement_secret))
+                .expect("replacement point");
+
+        assert!(
+            !binding.verify(&kernel),
+            "E' substitution must invalidate kernel binding",
+        );
+    }
+
+    #[test]
+    fn kernel_stealth_binding_rejects_kernel_field_mutation() {
+        let (kernel, kernel_secret, stealth_excess) = kernel_stealth_fixture();
+
+        let binding = KernelStealthBindingV1::sign(&kernel, &kernel_secret, stealth_excess)
+            .expect("valid binding");
+
+        let mut changed = kernel.clone();
+        changed.fee_darks += 1;
+
+        assert!(
+            !binding.verify(&changed),
+            "changing a signed kernel field must invalidate binding",
+        );
+    }
+
+    #[test]
+    fn kernel_stealth_binding_rejects_kernel_signature_mutation() {
+        let (kernel, kernel_secret, stealth_excess) = kernel_stealth_fixture();
+
+        let binding = KernelStealthBindingV1::sign(&kernel, &kernel_secret, stealth_excess)
+            .expect("valid binding");
+
+        let mut changed = kernel.clone();
+        changed.excess_sig.s[0] ^= 1;
+
+        assert!(
+            !binding.verify(&changed),
+            "binding must be tied to the concrete existing kernel signature",
+        );
+    }
+
+    #[test]
+    fn kernel_stealth_binding_rejects_wrong_kernel_secret() {
+        let (kernel, _kernel_secret, stealth_excess) = kernel_stealth_fixture();
+
+        let wrong_secret = Scalar::random(&mut OsRng);
+
+        assert!(
+            KernelStealthBindingV1::sign(&kernel, &wrong_secret, stealth_excess,).is_none(),
+            "secret not opening E must not authorize E'",
+        );
+    }
+
+    #[test]
+    fn kernel_stealth_binding_rejects_malformed_excess() {
+        let (kernel, kernel_secret, _stealth_excess) = kernel_stealth_fixture();
+
+        let malformed = StealthExcessV1 {
+            point: Commitment([0xff; 32]),
+        };
+
+        assert!(
+            KernelStealthBindingV1::sign(&kernel, &kernel_secret, malformed,).is_none(),
+            "malformed E' must fail closed",
+        );
+    }
+
+    #[test]
+    fn kernel_stealth_binding_roundtrips_exactly() {
+        let (kernel, kernel_secret, stealth_excess) = kernel_stealth_fixture();
+
+        let binding = KernelStealthBindingV1::sign(&kernel, &kernel_secret, stealth_excess)
+            .expect("valid binding");
+
+        let canonical = binding.canonical_bytes();
+
+        let encoded = serde_json::to_vec(&binding).expect("serialize binding");
+
+        let decoded: KernelStealthBindingV1 =
+            serde_json::from_slice(&encoded).expect("deserialize binding");
+
+        assert_eq!(decoded, binding);
+        assert_eq!(decoded.canonical_bytes(), canonical,);
+
+        assert!(
+            decoded.verify(&kernel),
+            "round-tripped binding must still verify",
+        );
     }
 }
