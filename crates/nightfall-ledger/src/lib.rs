@@ -8,11 +8,13 @@
 
 mod aggregate;
 mod builder;
+mod spend_auth;
 mod tx;
 mod utxo;
 
 pub use aggregate::*;
 pub use builder::*;
+pub use spend_auth::*;
 pub use tx::*;
 pub use utxo::*;
 
