@@ -447,7 +447,7 @@ impl ChainStore {
         let mut staged = state.clone();
 
         let pruned = staged
-            .prune_finalized_history()
+            .prune_expired_history()
             .map_err(|error| anyhow!("cut-through pruning failed: {error}"))?;
 
         let count = pruned.len();

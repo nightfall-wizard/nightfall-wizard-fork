@@ -631,6 +631,9 @@ pub enum CutThroughApplyError {
 
     #[error("malformed kernel excess during staged commit")]
     MalformedKernelExcess,
+    #[error("prunable height {height} has no matching retention record")]
+    MissingRetentionForPrune { height: u64 },
+
     #[error("retention height {height} crossed the horizon but has no matching undo record")]
     MissingUndoForPrune { height: u64 },
 
@@ -1108,7 +1111,7 @@ impl CutThroughStateV1 {
                 .retention
                 .blocks()
                 .get(&height)
-                .expect("prunable height originated from retention state");
+                .ok_or(CutThroughApplyError::MissingRetentionForPrune { height })?;
 
             let undo = self
                 .undo
@@ -1142,7 +1145,7 @@ impl CutThroughStateV1 {
     /// Once history has been pruned, a reorg deeper than the retained
     /// horizon must be recovered by replay/resync from older trusted chain
     /// data rather than reconstructed from missing local undo evidence.
-    pub fn prune_finalized_history(
+    pub fn prune_expired_history(
         &mut self,
     ) -> Result<Vec<PrunedCutThroughHistoryV1>, CutThroughApplyError> {
         let prunable = self.prunable_history()?;
@@ -1162,10 +1165,11 @@ impl CutThroughStateV1 {
                 });
             }
 
-            let retained = staged_retention
-                .blocks
-                .remove(&item.height)
-                .expect("validated prunable retention record exists");
+            let retained = staged_retention.blocks.remove(&item.height).ok_or(
+                CutThroughApplyError::MissingRetentionForPrune {
+                    height: item.height,
+                },
+            )?;
 
             let undo = staged_undo.remove(&item.height).ok_or(
                 CutThroughApplyError::MissingUndoForPrune {
@@ -2124,7 +2128,7 @@ mod tests {
         // Fixture horizon is 10 blocks.
         assert!(state.prunable_history().expect("prunable query").is_empty());
 
-        assert!(state.prune_finalized_history().expect("prune").is_empty());
+        assert!(state.prune_expired_history().expect("prune").is_empty());
 
         assert_eq!(state.retention.len(), 2,);
 
@@ -2140,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_removes_only_finalized_retention_undo_pairs() {
+    fn pruning_removes_only_horizon_expired_retention_undo_pairs() {
         let (mut state, tx_a, tx_b, _, _, _) = two_block_rollback_fixture();
 
         // h = 1:
@@ -2165,7 +2169,7 @@ mod tests {
 
         assert_eq!(state.prunable_history().expect("query"), expected,);
 
-        let pruned = state.prune_finalized_history().expect("prune");
+        let pruned = state.prune_expired_history().expect("prune");
 
         assert_eq!(pruned, expected,);
 
@@ -2185,7 +2189,7 @@ mod tests {
 
         // Idempotent at an unchanged tip.
         assert!(state
-            .prune_finalized_history()
+            .prune_expired_history()
             .expect("second prune")
             .is_empty());
     }
@@ -2210,7 +2214,9 @@ mod tests {
             .apply_transfer(&tx_b, Height(2), NetworkId::Devnet.proof_context())
             .expect("apply B");
 
-        state.prune_finalized_history().expect("prune finalized A");
+        state
+            .prune_expired_history()
+            .expect("prune horizon-expired A");
 
         assert!(!state.undo.contains_key(&1));
 
@@ -2269,7 +2275,7 @@ mod tests {
         let undo_before = state.undo.clone();
 
         assert_eq!(
-            state.prune_finalized_history(),
+            state.prune_expired_history(),
             Err(CutThroughApplyError::MissingUndoForPrune { height: 1 }),
         );
 
@@ -2287,5 +2293,15 @@ mod tests {
         assert!(state.retention.blocks().contains_key(&1));
 
         assert!(state.retention.blocks().contains_key(&2));
+    }
+
+    #[test]
+    fn pruning_missing_retention_error_is_typed() {
+        let error = CutThroughApplyError::MissingRetentionForPrune { height: 42 };
+
+        assert_eq!(
+            error.to_string(),
+            "prunable height 42 has no matching retention record",
+        );
     }
 }
