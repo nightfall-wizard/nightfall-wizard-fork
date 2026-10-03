@@ -2019,7 +2019,7 @@ mod tests {
 
         let first = build_cutthrough_transfer_v1(
             &owner,
-            &[spendable.clone()],
+            std::slice::from_ref(&spendable),
             &payments,
             1_000,
             &owner.address(),

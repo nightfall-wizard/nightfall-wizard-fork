@@ -1843,13 +1843,15 @@ mod tests {
         );
     }
 
-    fn kernel_bound_bundle_fixture() -> (
+    type KernelBoundBundleFixture = (
         KernelBoundAuthorizationBundleV1,
         Vec<nightfall_crypto::Output>,
         Vec<Commitment>,
         Vec<[u8; 32]>,
         Vec<TxKernel>,
-    ) {
+    );
+
+    fn kernel_bound_bundle_fixture() -> KernelBoundBundleFixture {
         let (loose, outputs, commits, kos) = valid_authorization_bundle_fixture();
 
         assert_eq!(
