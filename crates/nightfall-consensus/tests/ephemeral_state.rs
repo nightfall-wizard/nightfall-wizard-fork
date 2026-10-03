@@ -1329,3 +1329,290 @@ fn per_authority_quota_bounds_chain_bound_flood() {
     );
     pool.propose_signed_on_chain(&chain, &fresh).unwrap();
 }
+
+#[test]
+fn anchor_pointing_beyond_chain_tip_is_not_canonical() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 101, chain.genesis_hash));
+
+    let anchor = EphemeralChainAnchor {
+        tip_hash: nightfall_types::Hash256([1u8; 32]),
+        tip_height: Some(Height(5)),
+    };
+
+    let keys = WalletKeys::from_seed([101u8; 32]);
+    let proposal = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"future-anchor",
+        b"state",
+        anchor,
+        Height(5),
+        10,
+    );
+
+    let mut pool = EphemeralStatePool::new();
+    assert_eq!(
+        pool.propose_signed_on_chain(&chain, &proposal),
+        Err(EphemeralStateError::AnchorNotCanonical),
+    );
+    assert!(pool.is_empty());
+}
+
+#[test]
+fn anchor_with_none_height_requires_genesis_hash() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 102, chain.genesis_hash));
+
+    let anchor = EphemeralChainAnchor {
+        tip_hash: chain.headers[0].hash,
+        tip_height: None,
+    };
+
+    let keys = WalletKeys::from_seed([102u8; 32]);
+    let proposal = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"fake-genesis",
+        b"state",
+        anchor,
+        Height(0),
+        10,
+    );
+
+    let mut pool = EphemeralStatePool::new();
+    assert_eq!(
+        pool.propose_signed_on_chain(&chain, &proposal),
+        Err(EphemeralStateError::AnchorNotCanonical),
+    );
+    assert!(pool.is_empty());
+}
+
+#[test]
+fn anchor_hash_at_wrong_height_is_not_canonical() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 103, chain.genesis_hash));
+    chain
+        .headers
+        .push(synthetic_chain_header(1, 104, chain.headers[0].hash));
+
+    let anchor = EphemeralChainAnchor {
+        tip_hash: chain.headers[0].hash,
+        tip_height: Some(Height(1)),
+    };
+
+    let keys = WalletKeys::from_seed([103u8; 32]);
+    let proposal = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"wrong-height",
+        b"state",
+        anchor,
+        Height(1),
+        10,
+    );
+
+    let mut pool = EphemeralStatePool::new();
+    assert_eq!(
+        pool.propose_signed_on_chain(&chain, &proposal),
+        Err(EphemeralStateError::AnchorNotCanonical),
+    );
+    assert!(pool.is_empty());
+}
+
+#[test]
+fn expired_states_free_authority_quota() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 110, chain.genesis_hash));
+    let anchor = EphemeralChainAnchor::from_chain(&chain);
+    let keys = WalletKeys::from_seed([110u8; 32]);
+    let cap = EphemeralStatePool::MAX_STATES_PER_AUTHORITY;
+
+    let mut pool = EphemeralStatePool::new();
+
+    for i in 0..cap {
+        let key = format!("expire-{i}").into_bytes();
+        let prop = SignedEphemeralProposal::sign_anchored(
+            NetworkId::Devnet,
+            &keys,
+            &key,
+            b"state",
+            anchor,
+            Height(0),
+            5,
+        );
+        pool.propose_signed_on_chain(&chain, &prop).unwrap();
+    }
+
+    let denied = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"expire-denied",
+        b"state",
+        anchor,
+        Height(0),
+        5,
+    );
+    assert_eq!(
+        pool.propose_signed_on_chain(&chain, &denied),
+        Err(EphemeralStateError::AuthorityQuotaExceeded { max: cap }),
+    );
+
+    for h in 1..=5u64 {
+        chain.headers.push(synthetic_chain_header(
+            h,
+            (110u64 + h) as u8,
+            chain.headers[(h - 1) as usize].hash,
+        ));
+    }
+    let dropped = pool.reconcile_with_chain(&chain);
+    assert!(dropped >= cap);
+
+    let fresh = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"expire-fresh",
+        b"state",
+        anchor,
+        Height(0),
+        100,
+    );
+    pool.propose_signed_on_chain(&chain, &fresh).unwrap();
+}
+
+#[test]
+fn conflict_replacement_does_not_leak_authority_quota() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 120, chain.genesis_hash));
+    let anchor = EphemeralChainAnchor::from_chain(&chain);
+    let keys = WalletKeys::from_seed([120u8; 32]);
+    let cap = EphemeralStatePool::MAX_STATES_PER_AUTHORITY;
+
+    let mut pool = EphemeralStatePool::new();
+
+    // Repeatedly propose different payloads for the SAME logical key
+    // from the SAME authority. Later candidates have LONGER TTL and
+    // therefore lose the deterministic tie-break; the losing branch
+    // must remove all secondary index entries for the incumbent.
+    for i in 0..cap {
+        let payload = format!("payload-{i}").into_bytes();
+        let prop = SignedEphemeralProposal::sign_anchored(
+            NetworkId::Devnet,
+            &keys,
+            b"hot-key",
+            &payload,
+            anchor,
+            Height(0),
+            cap as u64 + i as u64,
+        );
+        match pool.propose_signed_on_chain(&chain, &prop) {
+            Ok(_) | Err(EphemeralStateError::KeyConflict { .. }) => {}
+            e => panic!("unexpected: {:?}", e),
+        }
+    }
+
+    // Exactly one live state for the authority.
+    for i in 0..(cap - 1) {
+        let key = format!("other-key-{i}").into_bytes();
+        let prop = SignedEphemeralProposal::sign_anchored(
+            NetworkId::Devnet,
+            &keys,
+            &key,
+            b"state",
+            anchor,
+            Height(0),
+            100,
+        );
+        pool.propose_signed_on_chain(&chain, &prop).unwrap();
+    }
+
+    let over = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"over-cap",
+        b"state",
+        anchor,
+        Height(0),
+        100,
+    );
+    assert_eq!(
+        pool.propose_signed_on_chain(&chain, &over),
+        Err(EphemeralStateError::AuthorityQuotaExceeded { max: cap }),
+    );
+}
+
+#[test]
+fn tampering_creation_height_invalidates_signature() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 130, chain.genesis_hash));
+    let anchor = EphemeralChainAnchor::from_chain(&chain);
+    let keys = WalletKeys::from_seed([130u8; 32]);
+    let mut proposal = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"ch-tamper",
+        b"state",
+        anchor,
+        Height(0),
+        10,
+    );
+    assert!(proposal.verify_signature());
+    proposal.created_height = Height(1);
+    assert!(!proposal.verify_signature());
+}
+
+#[test]
+fn tampering_ttl_invalidates_signature() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 131, chain.genesis_hash));
+    let anchor = EphemeralChainAnchor::from_chain(&chain);
+    let keys = WalletKeys::from_seed([131u8; 32]);
+    let mut proposal = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"ttl-tamper",
+        b"state",
+        anchor,
+        Height(0),
+        10,
+    );
+    assert!(proposal.verify_signature());
+    proposal.ttl_blocks = 11;
+    assert!(!proposal.verify_signature());
+}
+
+#[test]
+fn tampering_logical_key_invalidates_signature() {
+    let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+    chain
+        .headers
+        .push(synthetic_chain_header(0, 132, chain.genesis_hash));
+    let anchor = EphemeralChainAnchor::from_chain(&chain);
+    let keys = WalletKeys::from_seed([132u8; 32]);
+    let mut proposal = SignedEphemeralProposal::sign_anchored(
+        NetworkId::Devnet,
+        &keys,
+        b"key-tamper",
+        b"state",
+        anchor,
+        Height(0),
+        10,
+    );
+    assert!(proposal.verify_signature());
+    proposal.logical_key = b"different-key".to_vec();
+    assert!(!proposal.verify_signature());
+}
