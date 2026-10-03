@@ -295,8 +295,102 @@ impl ChainStore {
         Ok(Some(read_cutthrough_state_file(&path, network)?))
     }
 
+    /// Resolve the commit state after a persistence attempt.
+    ///
+    /// A file replacement can become visible before the parent-directory
+    /// fsync has completed. Therefore an error from persistence does not by
+    /// itself prove that the old sidecar is still authoritative.
+    ///
+    /// On error we re-read the authoritative path and compare its persisted
+    /// content against both the pre-transition and staged states.
+    fn publish_cutthrough_transition_after_persist(
+        &self,
+        network: NetworkId,
+        state: &mut CutThroughStateV1,
+        staged: CutThroughStateV1,
+        persist_result: anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if persist_result.is_ok() {
+            *state = staged;
+
+            return Ok(());
+        }
+
+        let persist_error = persist_result.expect_err("checked persistence error");
+
+        let before_checksum = state_checksum(CUTTHROUGH_STATE_FILE_VERSION, &network, state)
+            .context("checksum pre-transition cut-through state")?;
+
+        let staged_checksum = state_checksum(CUTTHROUGH_STATE_FILE_VERSION, &network, &staged)
+            .context("checksum staged cut-through state")?;
+
+        match self.load_cutthrough_state_v1(network) {
+            Ok(Some(authoritative)) => {
+                let authoritative_checksum =
+                    state_checksum(CUTTHROUGH_STATE_FILE_VERSION, &network, &authoritative)
+                        .context("checksum authoritative cut-through state")?;
+
+                if authoritative_checksum == staged_checksum {
+                    // The replacement became authoritative even though
+                    // persistence could not confirm full durability.
+                    //
+                    // Keep the running process coherent with disk, but still
+                    // report an error because crash durability was not
+                    // successfully confirmed.
+                    *state = authoritative;
+
+                    bail!(
+                        "cut-through persistence returned an error after the \
+                         staged state became authoritative; in-memory state \
+                         was reconciled to disk, but durability confirmation \
+                         failed: {persist_error}"
+                    );
+                }
+
+                if authoritative_checksum == before_checksum {
+                    // The old sidecar is still authoritative. The caller's
+                    // pre-transition RAM remains correct.
+                    bail!(
+                        "cut-through persistence failed before the staged \
+                         state became authoritative; previous state retained: \
+                         {persist_error}"
+                    );
+                }
+
+                bail!(
+                    "cut-through persistence failed and the authoritative \
+                     sidecar differs from both the pre-transition and staged \
+                     states; refusing to guess: {persist_error}"
+                );
+            }
+
+            Ok(None) => {
+                // Valid when there was no previous v3 sidecar and the failed
+                // write never became authoritative.
+                bail!(
+                    "cut-through persistence failed and no authoritative \
+                     sidecar exists; in-memory pre-transition state retained: \
+                     {persist_error}"
+                );
+            }
+
+            Err(reconcile_error) => {
+                bail!(
+                    "cut-through persistence failed and authoritative state \
+                     could not be reconciled; persistence error: \
+                     {persist_error}; reconciliation error: \
+                     {reconcile_error}"
+                );
+            }
+        }
+    }
+
     /// Apply one isolated-v3 transfer and persist the resulting complete
     /// cut-through state before publishing it to the caller.
+    ///
+    /// If persistence reports an error after replacement has already become
+    /// authoritative, RAM is reconciled to the authoritative sidecar before
+    /// the error is returned.
     pub fn apply_cutthrough_transfer_v1_durable(
         &self,
         network: NetworkId,
@@ -311,15 +405,16 @@ impl ChainStore {
             .apply_transfer(tx, confirmed_height, ctx)
             .map_err(|error| anyhow!("cut-through apply failed: {error}"))?;
 
-        self.save_cutthrough_state_v1(network, &staged)?;
+        let persist_result = self.save_cutthrough_state_v1(network, &staged);
 
-        *state = staged;
-
-        Ok(())
+        self.publish_cutthrough_transition_after_persist(network, state, staged, persist_result)
     }
 
     /// Roll back the current isolated-v3 tip, persist the complete restored
     /// state, then publish it to the caller.
+    ///
+    /// If persistence reports an error after replacement has already become
+    /// authoritative, RAM is reconciled before the error is returned.
     pub fn rollback_cutthrough_tip_v1_durable(
         &self,
         network: NetworkId,
@@ -329,19 +424,21 @@ impl ChainStore {
 
         let body_hash = staged
             .rollback_tip()
-            .map_err(|error| anyhow!("cut-through rollback failed: {error}"))?;
+            .map_err(|error| anyhow!("cut-through rollback failed: {error}"))?
+            .to_hex();
 
-        self.save_cutthrough_state_v1(network, &staged)?;
+        let persist_result = self.save_cutthrough_state_v1(network, &staged);
 
-        let body_hash = body_hash.to_hex();
-
-        *state = staged;
+        self.publish_cutthrough_transition_after_persist(network, state, staged, persist_result)?;
 
         Ok(body_hash)
     }
 
-    /// Remove horizon-finalized retention/undo material, persist the resulting
+    /// Remove horizon-expired retention/undo material, persist the resulting
     /// complete state, then publish it to the caller.
+    ///
+    /// The configured horizon is a retention boundary, not an independent
+    /// consensus-finality claim.
     pub fn prune_cutthrough_history_v1_durable(
         &self,
         network: NetworkId,
@@ -355,9 +452,9 @@ impl ChainStore {
 
         let count = pruned.len();
 
-        self.save_cutthrough_state_v1(network, &staged)?;
+        let persist_result = self.save_cutthrough_state_v1(network, &staged);
 
-        *state = staged;
+        self.publish_cutthrough_transition_after_persist(network, state, staged, persist_result)?;
 
         Ok(count)
     }
@@ -934,6 +1031,141 @@ mod tests {
         assert_eq!(reloaded.retention.len(), 1,);
 
         assert_eq!(reloaded.undo.len(), 1,);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pre_rename_style_error_keeps_previous_ram_and_disk() {
+        let dir = test_dir("reconcile-old");
+
+        let store = ChainStore::new(dir.clone());
+
+        let (mut state, tx, source_commit) = persistence_fixture();
+
+        store
+            .save_cutthrough_state_v1(NetworkId::Devnet, &state)
+            .expect("persist initial state");
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_before = state.ledger.kernel_sum();
+
+        let mut staged = state.clone();
+
+        staged
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context())
+            .expect("stage apply");
+
+        let result = store.publish_cutthrough_transition_after_persist(
+            NetworkId::Devnet,
+            &mut state,
+            staged,
+            Err(anyhow!("injected failure before authoritative rename")),
+        );
+
+        assert!(result.is_err());
+
+        assert_eq!(state.ledger.height, Height(0),);
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_before,);
+
+        assert!(state.ledger.utxos.contains(&source_commit));
+
+        assert!(state.retention.is_empty());
+
+        assert!(state.undo.is_empty());
+
+        let disk = store
+            .load_cutthrough_state_v1(NetworkId::Devnet)
+            .expect("load authoritative old state")
+            .expect("old sidecar");
+
+        assert_eq!(disk.ledger.height, Height(0),);
+
+        assert_eq!(disk.ledger.utxo_root(), root_before,);
+
+        assert_eq!(disk.ledger.kernel_sum(), kernel_before,);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn post_rename_style_error_reconciles_ram_to_authoritative_sidecar() {
+        let dir = test_dir("reconcile-new");
+
+        let store = ChainStore::new(dir.clone());
+
+        let (mut state, tx, source_commit) = persistence_fixture();
+
+        store
+            .save_cutthrough_state_v1(NetworkId::Devnet, &state)
+            .expect("persist initial state");
+
+        let mut staged = state.clone();
+
+        staged
+            .apply_transfer(&tx, Height(1), NetworkId::Devnet.proof_context())
+            .expect("stage apply");
+
+        let staged_root = staged.ledger.utxo_root();
+
+        let staged_kernel = staged.ledger.kernel_sum();
+
+        // Simulate the observable state after:
+        //
+        //   rename(tmp, authoritative) succeeds
+        //   parent-directory fsync then reports an error
+        //
+        // The new file is already visible and must therefore be treated as
+        // authoritative for this running process.
+        store
+            .save_cutthrough_state_v1(NetworkId::Devnet, &staged)
+            .expect("make staged state authoritative");
+
+        let result = store.publish_cutthrough_transition_after_persist(
+            NetworkId::Devnet,
+            &mut state,
+            staged,
+            Err(anyhow!(
+                "injected parent-directory fsync failure after rename"
+            )),
+        );
+
+        assert!(result.is_err());
+
+        // Critical property: despite returning Err, RAM must now agree with
+        // the sidecar that actually became authoritative.
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert_eq!(state.ledger.utxo_root(), staged_root,);
+
+        assert_eq!(state.ledger.kernel_sum(), staged_kernel,);
+
+        assert!(!state.ledger.utxos.contains(&source_commit));
+
+        assert_eq!(state.retention.len(), 1,);
+
+        assert_eq!(state.undo.len(), 1,);
+
+        let disk = store
+            .load_cutthrough_state_v1(NetworkId::Devnet)
+            .expect("reload authoritative staged state")
+            .expect("staged sidecar");
+
+        assert_eq!(disk.ledger.height, state.ledger.height,);
+
+        assert_eq!(disk.ledger.utxo_root(), state.ledger.utxo_root(),);
+
+        assert_eq!(disk.ledger.kernel_sum(), state.ledger.kernel_sum(),);
+
+        assert_eq!(disk.retention.len(), state.retention.len(),);
+
+        assert_eq!(disk.undo.len(), state.undo.len(),);
+
+        assert_eq!(state.ledger.verify_supply(), Ok(()),);
 
         fs::remove_dir_all(&dir).ok();
     }
