@@ -21,9 +21,9 @@ use anyhow::{anyhow, bail, Context};
 
 use nightfall_crypto::hash_domain;
 
-use nightfall_ledger::{CutThroughStateV1, LedgerState};
+use nightfall_ledger::{CutThroughStateV1, CutThroughTransactionV1, LedgerState};
 
-use nightfall_types::NetworkId;
+use nightfall_types::{Height, NetworkId};
 
 use serde::{Deserialize, Serialize};
 
@@ -293,6 +293,73 @@ impl ChainStore {
         }
 
         Ok(Some(read_cutthrough_state_file(&path, network)?))
+    }
+
+    /// Apply one isolated-v3 transfer and persist the resulting complete
+    /// cut-through state before publishing it to the caller.
+    pub fn apply_cutthrough_transfer_v1_durable(
+        &self,
+        network: NetworkId,
+        state: &mut CutThroughStateV1,
+        tx: &CutThroughTransactionV1,
+        confirmed_height: Height,
+        ctx: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut staged = state.clone();
+
+        staged
+            .apply_transfer(tx, confirmed_height, ctx)
+            .map_err(|error| anyhow!("cut-through apply failed: {error}"))?;
+
+        self.save_cutthrough_state_v1(network, &staged)?;
+
+        *state = staged;
+
+        Ok(())
+    }
+
+    /// Roll back the current isolated-v3 tip, persist the complete restored
+    /// state, then publish it to the caller.
+    pub fn rollback_cutthrough_tip_v1_durable(
+        &self,
+        network: NetworkId,
+        state: &mut CutThroughStateV1,
+    ) -> anyhow::Result<String> {
+        let mut staged = state.clone();
+
+        let body_hash = staged
+            .rollback_tip()
+            .map_err(|error| anyhow!("cut-through rollback failed: {error}"))?;
+
+        self.save_cutthrough_state_v1(network, &staged)?;
+
+        let body_hash = body_hash.to_hex();
+
+        *state = staged;
+
+        Ok(body_hash)
+    }
+
+    /// Remove horizon-finalized retention/undo material, persist the resulting
+    /// complete state, then publish it to the caller.
+    pub fn prune_cutthrough_history_v1_durable(
+        &self,
+        network: NetworkId,
+        state: &mut CutThroughStateV1,
+    ) -> anyhow::Result<usize> {
+        let mut staged = state.clone();
+
+        let pruned = staged
+            .prune_finalized_history()
+            .map_err(|error| anyhow!("cut-through pruning failed: {error}"))?;
+
+        let count = pruned.len();
+
+        self.save_cutthrough_state_v1(network, &staged)?;
+
+        *state = staged;
+
+        Ok(count)
     }
 }
 
@@ -614,6 +681,259 @@ mod tests {
             .is_err());
 
         assert!(!store.cutthrough_state_v1_path().exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn durable_apply_and_rollback_stay_in_sync_with_sidecar() {
+        let dir = test_dir("durable-apply-rollback");
+
+        let store = ChainStore::new(dir.clone());
+
+        let (mut state, tx, source_commit) = persistence_fixture();
+
+        let initial_root = state.ledger.utxo_root();
+
+        let initial_kernel = state.ledger.kernel_sum();
+
+        store
+            .save_cutthrough_state_v1(NetworkId::Devnet, &state)
+            .expect("persist initial state");
+
+        store
+            .apply_cutthrough_transfer_v1_durable(
+                NetworkId::Devnet,
+                &mut state,
+                &tx,
+                Height(1),
+                NetworkId::Devnet.proof_context(),
+            )
+            .expect("durable apply");
+
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert_eq!(state.retention.len(), 1,);
+
+        assert_eq!(state.undo.len(), 1,);
+
+        assert!(!state.ledger.utxos.contains(&source_commit));
+
+        let disk = store
+            .load_cutthrough_state_v1(NetworkId::Devnet)
+            .expect("load after apply")
+            .expect("sidecar");
+
+        assert_eq!(disk.ledger.height, state.ledger.height,);
+
+        assert_eq!(disk.ledger.utxo_root(), state.ledger.utxo_root(),);
+
+        assert_eq!(disk.ledger.kernel_sum(), state.ledger.kernel_sum(),);
+
+        assert_eq!(disk.retention.len(), state.retention.len(),);
+
+        assert_eq!(disk.undo.len(), state.undo.len(),);
+
+        let rolled_back = store
+            .rollback_cutthrough_tip_v1_durable(NetworkId::Devnet, &mut state)
+            .expect("durable rollback");
+
+        assert_eq!(rolled_back, tx.body.hash().to_hex(),);
+
+        assert_eq!(state.ledger.height, Height(0),);
+
+        assert_eq!(state.ledger.utxo_root(), initial_root,);
+
+        assert_eq!(state.ledger.kernel_sum(), initial_kernel,);
+
+        assert!(state.ledger.utxos.contains(&source_commit));
+
+        assert!(state.retention.is_empty());
+
+        assert!(state.undo.is_empty());
+
+        let disk = store
+            .load_cutthrough_state_v1(NetworkId::Devnet)
+            .expect("load after rollback")
+            .expect("sidecar");
+
+        assert_eq!(disk.ledger.height, Height(0),);
+
+        assert_eq!(disk.ledger.utxo_root(), initial_root,);
+
+        assert_eq!(disk.ledger.kernel_sum(), initial_kernel,);
+
+        assert!(disk.retention.is_empty());
+
+        assert!(disk.undo.is_empty());
+
+        assert_eq!(disk.ledger.verify_supply(), Ok(()),);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn durable_apply_does_not_publish_when_persistence_fails() {
+        let dir = test_dir("apply-save-failure");
+
+        let store = ChainStore::new(dir.clone());
+
+        let (mut state, tx, source_commit) = persistence_fixture();
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_before = state.ledger.kernel_sum();
+
+        let burned_before = state.ledger.supply.total_burned_darks;
+
+        let tmp = store.cutthrough_state_v1_tmp_path();
+
+        // File::create(tmp) must fail before authoritative rename.
+        fs::create_dir_all(&tmp).expect("create blocking tmp directory");
+
+        assert!(store
+            .apply_cutthrough_transfer_v1_durable(
+                NetworkId::Devnet,
+                &mut state,
+                &tx,
+                Height(1),
+                NetworkId::Devnet.proof_context(),
+            )
+            .is_err());
+
+        assert_eq!(state.ledger.height, Height(0),);
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_before,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, burned_before,);
+
+        assert!(state.ledger.utxos.contains(&source_commit));
+
+        assert!(state.retention.is_empty());
+
+        assert!(state.undo.is_empty());
+
+        assert!(!store.cutthrough_state_v1_path().exists());
+
+        fs::remove_dir_all(&tmp).expect("remove blocking tmp directory");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn durable_rollback_does_not_publish_when_persistence_fails() {
+        let dir = test_dir("rollback-save-failure");
+
+        let store = ChainStore::new(dir.clone());
+
+        let (mut state, tx, source_commit) = persistence_fixture();
+
+        store
+            .apply_cutthrough_transfer_v1_durable(
+                NetworkId::Devnet,
+                &mut state,
+                &tx,
+                Height(1),
+                NetworkId::Devnet.proof_context(),
+            )
+            .expect("durable apply");
+
+        let root_before = state.ledger.utxo_root();
+
+        let kernel_before = state.ledger.kernel_sum();
+
+        let burned_before = state.ledger.supply.total_burned_darks;
+
+        let tmp = store.cutthrough_state_v1_tmp_path();
+
+        fs::create_dir_all(&tmp).expect("create blocking tmp directory");
+
+        assert!(store
+            .rollback_cutthrough_tip_v1_durable(NetworkId::Devnet, &mut state,)
+            .is_err());
+
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert_eq!(state.ledger.utxo_root(), root_before,);
+
+        assert_eq!(state.ledger.kernel_sum(), kernel_before,);
+
+        assert_eq!(state.ledger.supply.total_burned_darks, burned_before,);
+
+        assert!(!state.ledger.utxos.contains(&source_commit));
+
+        assert_eq!(state.retention.len(), 1,);
+
+        assert_eq!(state.undo.len(), 1,);
+
+        // Previous authoritative sidecar must remain intact.
+        let disk = store
+            .load_cutthrough_state_v1(NetworkId::Devnet)
+            .expect("load authoritative state")
+            .expect("sidecar");
+
+        assert_eq!(disk.ledger.height, Height(1),);
+
+        assert_eq!(disk.ledger.utxo_root(), root_before,);
+
+        assert_eq!(disk.ledger.kernel_sum(), kernel_before,);
+
+        assert_eq!(disk.retention.len(), 1,);
+
+        assert_eq!(disk.undo.len(), 1,);
+
+        fs::remove_dir_all(&tmp).expect("remove blocking tmp directory");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn durable_prune_noop_remains_restart_consistent() {
+        let dir = test_dir("durable-prune-noop");
+
+        let store = ChainStore::new(dir.clone());
+
+        let (mut state, tx, _) = persistence_fixture();
+
+        store
+            .apply_cutthrough_transfer_v1_durable(
+                NetworkId::Devnet,
+                &mut state,
+                &tx,
+                Height(1),
+                NetworkId::Devnet.proof_context(),
+            )
+            .expect("durable apply");
+
+        // Fixture horizon = 10.
+        let pruned = store
+            .prune_cutthrough_history_v1_durable(NetworkId::Devnet, &mut state)
+            .expect("durable prune");
+
+        assert_eq!(pruned, 0,);
+
+        assert_eq!(state.ledger.height, Height(1),);
+
+        assert_eq!(state.retention.len(), 1,);
+
+        assert_eq!(state.undo.len(), 1,);
+
+        let reloaded = store
+            .load_cutthrough_state_v1(NetworkId::Devnet)
+            .expect("reload")
+            .expect("sidecar");
+
+        assert_eq!(reloaded.ledger.height, state.ledger.height,);
+
+        assert_eq!(reloaded.ledger.utxo_root(), state.ledger.utxo_root(),);
+
+        assert_eq!(reloaded.ledger.kernel_sum(), state.ledger.kernel_sum(),);
+
+        assert_eq!(reloaded.retention.len(), 1,);
+
+        assert_eq!(reloaded.undo.len(), 1,);
 
         fs::remove_dir_all(&dir).ok();
     }
