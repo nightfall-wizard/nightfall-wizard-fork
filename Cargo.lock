@@ -3042,6 +3042,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nightfall-node-kit"
+version = "0.1.0"
+
+[[package]]
 name = "nightfall-p2p"
 version = "1.0.5"
 dependencies = [

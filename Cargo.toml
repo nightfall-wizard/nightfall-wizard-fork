@@ -11,7 +11,7 @@ members = [
     "crates/nightfall-wallet",
     "crates/nightfall-core",
     "crates/nightfall-mobile",
-    "crates/nightfall-web",
+    "crates/nightfall-web", "crates/nightfall-node-kit",
 ]
 
 [workspace.package]

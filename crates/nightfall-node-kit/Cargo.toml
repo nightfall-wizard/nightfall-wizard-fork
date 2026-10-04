@@ -1,0 +1,13 @@
+[package]
+name = "nightfall-node-kit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "nightfall_node_kit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nightfall-node-kit"
+path = "src/main.rs"
