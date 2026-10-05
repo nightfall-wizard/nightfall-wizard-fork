@@ -1,0 +1,22 @@
+{
+  "marker": "AUTO-GENERATED-INDEX-BY-NIGHTFALL-SECURITY-GATE-ONE-SHOT",
+  "generated_at": "2026-10-05T16:52:33Z",
+  "repository": "Instinctes/nightfall",
+  "branch": "security/audit-gate-consolidation-v2",
+  "files": {
+    "document": "docs/SECURITY-REVIEW-CONSOLIDATION.md",
+    "claim_register": "docs/SECURITY-REVIEW-CLAIMS.json"
+  },
+  "purpose": "security_review_gate_index",
+  "status": {
+    "review_gate": "proposed",
+    "maintainer_acceptance": "not_proven",
+    "third_party_review_completion": "not_proven",
+    "protocol_correctness": "not_proven",
+    "germany_eu_compliance_conclusion": "not_proven",
+    "investment_suitability": "not_proven",
+    "custody_reliability": "not_proven",
+    "source_release_asset_correspondence": "not_proven",
+    "byte_identical_rebuilds": "not_proven"
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "marker": "AUTO-GENERATED-CLAIMS-BY-NIGHTFALL-SECURITY-GATE-ONE-SHOT",
+  "generated_at": "2026-10-05T16:52:32Z",
+  "repository": "Instinctes/nightfall",
+  "branch": "security/audit-gate-consolidation-v2",
+  "purpose": "security_review_gate_claim_boundary",
+  "allowed_status_values": [
+    "not_proven",
+    "not_verifiable",
+    "not_enough_evidence",
+    "proposed"
+  ],
+  "forbidden_positive_status_values": [
+    "proven",
+    "verified",
+    "passed",
+    "approved",
+    "certified",
+    "audited",
+    "legally_cleared",
+    "safe",
+    "secure"
+  ],
+  "claims": [
+    {
+      "id": "third_party_review_completed",
+      "statement": "Independent third-party review completed",
+      "status": "not_proven"
+    },
+    {
+      "id": "protocol_correctness",
+      "statement": "Protocol correctness",
+      "status": "not_proven"
+    },
+    {
+      "id": "germany_eu_compliance_conclusion",
+      "statement": "Germany/EU compliance conclusion",
+      "status": "not_proven"
+    },
+    {
+      "id": "investment_suitability",
+      "statement": "Investment suitability",
+      "status": "not_proven"
+    },
+    {
+      "id": "custody_reliability",
+      "statement": "Custody reliability",
+      "status": "not_proven"
+    },
+    {
+      "id": "source_release_asset_correspondence",
+      "statement": "Source and release-asset correspondence",
+      "status": "not_proven"
+    },
+    {
+      "id": "byte_identical_rebuilds",
+      "statement": "Byte-identical rebuilds",
+      "status": "not_proven"
+    },
+    {
+      "id": "mainnet_consensus_correctness",
+      "statement": "Mainnet consensus correctness",
+      "status": "not_proven"
+    },
+    {
+      "id": "hidden_inflation_absence",
+      "statement": "No hidden-inflation defect exists",
+      "status": "not_proven"
+    },
+    {
+      "id": "wallet_key_loss_absence",
+      "statement": "No wallet/key-loss defect exists",
+      "status": "not_proven"
+    },
+    {
+      "id": "privacy_defect_absence",
+      "statement": "No privacy defect exists",
+      "status": "not_proven"
+    },
+    {
+      "id": "review_gate_created",
+      "statement": "A review coordination gate is proposed",
+      "status": "proposed"
+    },
+    {
+      "id": "maintainer_acceptance",
+      "statement": "Maintainer accepted this process",
+      "status": "not_proven"
+    },
+    {
+      "id": "external_reviewer_acceptance",
+      "statement": "External reviewer accepted this process",
+      "status": "not_proven"
+    }
+  ]
+}
