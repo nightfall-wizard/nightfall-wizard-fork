@@ -1,14 +1,30 @@
 {
   "marker": "AUTO-GENERATED-CLAIMS-BY-NIGHTFALL-SECURITY-GATE-ONE-SHOT",
-  "generated_at": "2026-10-05T16:52:32Z",
+  "generated_at": "2026-10-05T17:00:40Z",
   "repository": "Instinctes/nightfall",
   "branch": "security/audit-gate-consolidation-v2",
-  "purpose": "security_review_gate_claim_boundary",
+  "controlling_issue": "#39",
+  "controlling_issue_url": "https://github.com/Instinctes/nightfall/issues/39",
+  "purpose": "security_review_gate_claim_boundary_aligned_to_issue_39",
+  "policy": {
+    "issue_39_controls": true,
+    "does_not_replace_issue_39_first_review_batch": true,
+    "no_expectation_to_review_before_issue_39_batch": true,
+    "can_be_closed_or_kept_in_fork_if_it_adds_maintainer_load": true
+  },
+  "issue_39_first_review_batch": [
+    "#16",
+    "#14",
+    "#26",
+    "#37",
+    "#30 or #36"
+  ],
   "allowed_status_values": [
     "not_proven",
     "not_verifiable",
     "not_enough_evidence",
-    "proposed"
+    "proposed",
+    "subordinate_to_issue_39"
   ],
   "forbidden_positive_status_values": [
     "proven",
@@ -22,6 +38,16 @@
     "secure"
   ],
   "claims": [
+    {
+      "id": "issue_39_is_controlling_orientation",
+      "statement": "Issue #39 controls review order and maintainer-load policy",
+      "status": "subordinate_to_issue_39"
+    },
+    {
+      "id": "pr_41_review_priority",
+      "statement": "PR #41 should not be reviewed before the smaller first review batch from Issue #39 unless maintainers explicitly want the process document first",
+      "status": "subordinate_to_issue_39"
+    },
     {
       "id": "third_party_review_completed",
       "statement": "Independent third-party review completed",
