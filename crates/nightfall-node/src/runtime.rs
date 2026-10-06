@@ -1551,6 +1551,7 @@ fn apply_ibd_page(inner: &mut NodeInner, blocks: Vec<Block>, now: u64) -> IbdPag
 }
 
 const REORG_FETCH_COOLDOWN_SECS: u64 = 15;
+const REORG_FETCH_MAX_PEERS: usize = 256;
 
 /// Claim the side-channel reorg-fetch slot for one peer.
 ///
@@ -1563,6 +1564,13 @@ fn claim_reorg_fetch_slot(last_by_peer: &mut HashMap<String, u64>, addr: &str, n
     last_by_peer.retain(|_, last| now.saturating_sub(*last) < REORG_FETCH_COOLDOWN_SECS);
 
     if last_by_peer.contains_key(addr) {
+        return false;
+    }
+
+    // Keep peer-scoped recovery from becoming an unbounded peer-churn map.
+    // If the cooldown window is saturated, fail closed for this peer and
+    // try again after entries naturally expire.
+    if last_by_peer.len() >= REORG_FETCH_MAX_PEERS {
         return false;
     }
 
@@ -3250,7 +3258,7 @@ mod sync_hold_tests {
 
 #[cfg(test)]
 mod reorg_fetch_throttle_tests {
-    use super::{claim_reorg_fetch_slot, REORG_FETCH_COOLDOWN_SECS};
+    use super::{claim_reorg_fetch_slot, REORG_FETCH_COOLDOWN_SECS, REORG_FETCH_MAX_PEERS};
     use std::collections::HashMap;
 
     #[test]
@@ -3281,5 +3289,35 @@ mod reorg_fetch_throttle_tests {
             "127.0.0.1:10001",
             now + REORG_FETCH_COOLDOWN_SECS
         ));
+    }
+
+    #[test]
+    fn reorg_fetch_slots_are_bounded_under_peer_churn() {
+        let mut slots = HashMap::new();
+        let now = 2_000;
+
+        for i in 0..REORG_FETCH_MAX_PEERS {
+            let addr = format!("127.0.0.1:{}", 20_000 + i);
+            assert!(claim_reorg_fetch_slot(&mut slots, &addr, now));
+        }
+
+        assert_eq!(slots.len(), REORG_FETCH_MAX_PEERS);
+
+        // A churned extra peer must not grow the cooldown map without bound.
+        assert!(!claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:29999",
+            now + 1
+        ));
+        assert_eq!(slots.len(), REORG_FETCH_MAX_PEERS);
+
+        // After the cooldown expires, stale entries are removed and recovery
+        // attempts can proceed again.
+        assert!(claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:29999",
+            now + REORG_FETCH_COOLDOWN_SECS
+        ));
+        assert_eq!(slots.len(), 1);
     }
 }
