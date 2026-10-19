@@ -10,14 +10,26 @@ python3 - <<'PY'
 from pathlib import Path
 p=Path("crates/nightfall-node/src/recovery.rs")
 s=p.read_text()
-a='for (name, _) in &original { fs::remove_file(tmp.0.join(name)).unwrap(); }'
-b='for (name, _) in &original { let path = tmp.0.join(name); if path.exists() { fs::remove_file(path).unwrap(); } }'
-if s.count(a)==1:
-    p.write_text(s.replace(a,b,1))
-elif s.count(b)==1:
+import re
+pattern = re.compile(
+    r'for\s*\(\s*name\s*,\s*_\s*\)\s*in\s*&original\s*\{\s*'
+    r'fs::remove_file\(\s*tmp\.0\.join\(\s*name\s*\)\s*\)\.unwrap\(\);\s*\}'
+)
+replacement = """for (name, _) in &original {
+                    let path = tmp.0.join(name);
+                    if path.exists() {
+                        fs::remove_file(path).unwrap();
+                    }
+                }"""
+matches = list(pattern.finditer(s))
+if len(matches) == 1:
+    s = pattern.sub(replacement, s, count=1)
+    p.write_text(s)
+    print("Recovery-Restore-Test korrigiert.")
+elif "let path = tmp.0.join(name);" in s and "if path.exists()" in s:
     print("Testkorrektur bereits vorhanden.")
 else:
-    raise SystemExit("STOP: Erwartete Testzeile fehlt, keine Aenderung.")
+    raise SystemExit("STOP: Restore-Test passt nicht zum erwarteten Code; kein Push.")
 PY
 echo "[1/4] Formatierung"
 cargo fmt --all
