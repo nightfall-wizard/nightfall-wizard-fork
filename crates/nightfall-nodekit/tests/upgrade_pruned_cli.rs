@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn upgrade_pruned_without_force_never_mutates_wallet_or_chain() {
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!(
         "nf-nodekit-upgrade-refuse-{}-{stamp}",
         std::process::id()
@@ -25,7 +28,10 @@ fn upgrade_pruned_without_force_never_mutates_wallet_or_chain() {
         .output()
         .expect("spawn Node Kit");
 
-    assert!(!output.status.success(), "unsafe upgrade without --force succeeded");
+    assert!(
+        !output.status.success(),
+        "unsafe upgrade without --force succeeded"
+    );
     assert_eq!(fs::read(&wallet_file).unwrap(), b"wallet must survive");
     assert_eq!(fs::read(&meta_file).unwrap(), b"not-a-chain-fixture");
     assert!(!dir.join(".recovery-journal.json").exists());
