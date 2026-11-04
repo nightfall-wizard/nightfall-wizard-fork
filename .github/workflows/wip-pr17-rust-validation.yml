@@ -17,3 +17,7 @@ jobs:
         run: cargo fmt --all --check
       - name: Targeted regression
         run: cargo test --locked -p nightfall-storage legacy_pruned_validation_record_fails_closed_without_seals
+      - name: Node Kit explicit upgrade refusal CLI
+        run: cargo test --locked -p nightfall-nodekit --test upgrade_pruned_cli
+      - name: Node Kit compile and check
+        run: cargo check --locked -p nightfall-nodekit --all-targets
