@@ -1,0 +1,19 @@
+name: WIP PR7 targeted Rust validation
+on:
+  push:
+    branches:
+      - wip/pr7-bounded-shutdown-s8-20261104
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Targeted regression
+        run: cargo test --locked -p nightfall-node --lib bounded_shutdown_wip_tests -- --test-threads=1
