@@ -1449,9 +1449,13 @@ mod tests {
     /// state is deliberately inconsistent and must not be accepted.
     #[test]
     fn interrupted_checkpoint_import_with_partial_chain_files_fails_closed() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "nf-checkpoint-half-import-{}-{stamp}", std::process::id()
+            "nf-checkpoint-half-import-{}-{stamp}",
+            std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
         let blocks = dir.join(codec::BLOCKS_BIN);
@@ -1474,9 +1478,13 @@ mod tests {
 
     #[test]
     fn interrupted_checkpoint_import_is_never_loaded() {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "nf-checkpoint-interrupt-{}-{unique}", std::process::id()
+            "nf-checkpoint-interrupt-{}-{unique}",
+            std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join(CHECKPOINT_IMPORT_JOURNAL);
@@ -1490,7 +1498,6 @@ mod tests {
         assert_eq!(fs::read(&marker).unwrap(), b"interrupted");
         fs::remove_dir_all(dir).unwrap();
     }
-
 
     /// An interrupted recovery marks the datadir unsafe for every entry
     /// point that reads or rewrites the chain, not only a normal start.
