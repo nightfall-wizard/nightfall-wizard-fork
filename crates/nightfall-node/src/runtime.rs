@@ -2712,10 +2712,7 @@ mod common_ancestor_search_tests {
             highest_common_within(start, max_back, |h| Some(h < ours - depth)),
             None
         );
-        assert_eq!(
-            ancestor_search_window(ours, ours - depth - 1),
-            None
-        );
+        assert_eq!(ancestor_search_window(ours, ours - depth - 1), None);
     }
 
     #[test]
