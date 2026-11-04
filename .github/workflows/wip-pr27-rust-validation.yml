@@ -1,0 +1,19 @@
+name: WIP PR27 targeted Rust validation
+on:
+  push:
+    branches:
+      - wip/pr27-interrupt-journal-s8-20261104
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Targeted regression
+        run: cargo test --locked -p nightfall-storage interrupted_checkpoint_import_is_never_loaded
