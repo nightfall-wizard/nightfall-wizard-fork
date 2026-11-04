@@ -1,0 +1,22 @@
+name: Repeated multi-node acceptance (WIP)
+on:
+  push:
+    branches:
+      - wip/pr8-readiness-s8-20261104
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  multi-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Repeat real multi-node tests
+        run: |
+          set -eu
+          for n in 1 2 3; do
+            echo "multi-node run $n"
+            cargo test --locked -p nightfall-node --test multinode -- --test-threads=1
+          done
