@@ -17,3 +17,5 @@ jobs:
         run: cargo fmt --all --check
       - name: Targeted regression
         run: cargo test --locked -p nightfall-node --lib bounded_shutdown_wip_tests -- --test-threads=1
+      - name: Real daemon SIGTERM and datadir restart
+        run: cargo test --locked -p nightfall-node --test daemon_stop -- --test-threads=1
