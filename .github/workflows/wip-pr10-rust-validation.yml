@@ -17,3 +17,5 @@ jobs:
         run: cargo fmt --all --check
       - name: Targeted regression
         run: cargo test --locked -p nightfall-node --lib exactly_at_reorg_depth_boundary_is_accepted
+      - name: Real shorter-heavier two-node acceptance
+        run: cargo test --locked -p nightfall-node --test shorter_heavier -- --test-threads=1
