@@ -517,7 +517,9 @@ mod request_blocks_framing_tests {
         let address = listener.local_addr().unwrap();
         let responder = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
             let mut reader = BufReader::with_capacity(1, socket.try_clone().unwrap());
             match read_msg(&mut reader).unwrap() {
                 PeerMsg::GetBlocks { from_height, limit } => {
@@ -531,7 +533,9 @@ mod request_blocks_framing_tests {
             write_msg(&mut socket, &PeerMsg::Blocks { blocks: vec![] }).unwrap();
         });
         let mut socket = TcpStream::connect(address).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         assert!(request_blocks(&mut socket, 42, 3).unwrap().is_empty());
         responder.join().unwrap();
     }
@@ -551,7 +555,9 @@ mod request_blocks_framing_tests {
             }
         });
         let mut socket = TcpStream::connect(address).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let err = request_blocks(&mut socket, 0, 2).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         responder.join().unwrap();
