@@ -1,0 +1,19 @@
+name: WIP PR10 targeted Rust validation
+on:
+  push:
+    branches:
+      - wip/pr10-reorg-boundary-s8-20261104
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Targeted regression
+        run: cargo test --locked -p nightfall-node --lib exactly_at_reorg_depth_boundary_is_accepted
