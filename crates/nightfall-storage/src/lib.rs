@@ -1444,6 +1444,34 @@ fn getrandom_bytes(out: &mut [u8]) {
 mod tests {
     use super::*;
 
+    /// Crash-injection analogue: an import persisted only the first chain
+    /// file and its journal before the process disappeared. The remaining
+    /// state is deliberately inconsistent and must not be accepted.
+    #[test]
+    fn interrupted_checkpoint_import_with_partial_chain_files_fails_closed() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nf-checkpoint-half-import-{}-{stamp}", std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let blocks = dir.join(codec::BLOCKS_BIN);
+        let meta = dir.join("chain-meta.json");
+        let journal = dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        fs::write(&blocks, b"truncated-before-metadata").unwrap();
+        fs::write(&meta, b"{").unwrap();
+        fs::write(&journal, b"in-progress").unwrap();
+
+        let err = ChainStore::new(&dir)
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("interrupted checkpoint import"), "{err}");
+        assert_eq!(fs::read(&blocks).unwrap(), b"truncated-before-metadata");
+        assert_eq!(fs::read(&meta).unwrap(), b"{");
+        assert_eq!(fs::read(&journal).unwrap(), b"in-progress");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn interrupted_checkpoint_import_is_never_loaded() {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
