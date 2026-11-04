@@ -138,7 +138,8 @@ fn run() -> Result<ExitCode> {
                     "Legacy pruned 1.1.x state cannot be safely sealed without its deleted historical bodies. Stop the node, back up the wallet, and re-run upgrade-pruned with --force to preserve the old chain in a recovery backup and start a fresh verified resync. No files were changed."
                 );
             }
-            let network_explicit = std::env::args().skip(1)
+            let network_explicit = std::env::args()
+                .skip(1)
                 .any(|arg| arg == "--network" || arg.starts_with("--network="));
             let options = nightfall_node::recovery::RecoverOpts {
                 datadir: datadir.clone(),
@@ -150,15 +151,22 @@ fn run() -> Result<ExitCode> {
             nightfall_node::recovery::precheck(&options, network_explicit, true)?;
 
             let validate_legacy = || -> Result<()> {
-                let meta: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(datadir.join("chain-meta.json"))?
-                )?;
+                let meta: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(datadir.join("chain-meta.json"))?)?;
                 let is_pruned = meta.get("pruned").and_then(|v| v.as_bool()) == Some(true)
-                    && meta.get("first_height").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
-                let seal_horizon = meta.get("validated_horizon_fingerprint")
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                let seal_headers = meta.get("validated_headers_fingerprint")
-                    .and_then(|v| v.as_str()).unwrap_or("");
+                    && meta
+                        .get("first_height")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        > 0;
+                let seal_horizon = meta
+                    .get("validated_horizon_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let seal_headers = meta
+                    .get("validated_headers_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if !is_pruned || (!seal_horizon.is_empty() && !seal_headers.is_empty()) {
                     anyhow::bail!(
                         "upgrade-pruned only accepts legacy pruned data without complete seals; this datadir is not such a case"
@@ -175,15 +183,21 @@ fn run() -> Result<ExitCode> {
 
             let report = nightfall_node::recovery::recover_stalled_fork(&options)?;
             if cli.json {
-                println!("{}", serde_json::json!({
-                    "network": network.as_str(),
-                    "backup": report.backup_dir,
-                    "old_tip": report.previous_tip,
-                    "resync_required": true,
-                    "wallet_preserved": true
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "network": network.as_str(),
+                        "backup": report.backup_dir,
+                        "old_tip": report.previous_tip,
+                        "resync_required": true,
+                        "wallet_preserved": true
+                    })
+                );
             } else {
-                println!("Legacy pruned chain archived in {}", report.backup_dir.display());
+                println!(
+                    "Legacy pruned chain archived in {}",
+                    report.backup_dir.display()
+                );
                 println!("Wallet preserved. Restart the node with mining off until the whole chain is independently verified and synchronized.");
                 println!("No unverified old storage seals were trusted or minted.");
             }
