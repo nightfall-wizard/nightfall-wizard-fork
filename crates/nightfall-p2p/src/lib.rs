@@ -518,8 +518,8 @@ mod request_blocks_framing_tests {
         let responder = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut reader = BufReader::with_capacity(1, socket.try_clone().unwrap());
             match read_msg(&mut reader).unwrap() {
                 PeerMsg::GetBlocks { from_height, limit } => {
