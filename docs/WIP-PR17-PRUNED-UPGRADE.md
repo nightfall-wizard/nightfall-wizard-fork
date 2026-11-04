@@ -25,3 +25,30 @@ of old metadata, horizon, headers, and retained bodies on refused startup.
 A real untouched 1.1.2 pruned fixture and tested recovery UX, an explicit
 safe upgrade path, interruption fault injection, mainnet-scale startup
 benchmark, and maintainer approval after the consensus activation freeze.
+
+## Explicit offline Node Kit migration command (WIP)
+
+After stopping the node and backing up the wallet, the operator can run:
+
+```shell
+nightfall-nodekit --network mainnet upgrade-pruned --datadir /ABSOLUTE/PATH/TO/N8
+```
+
+Without `--force` the command refuses and does not touch wallet or chain.
+To perform the confirmed archive backup and chain reset:
+
+```shell
+nightfall-nodekit --network mainnet upgrade-pruned --datadir /ABSOLUTE/PATH/TO/N8 --force
+```
+
+This command checks that the datadir is a legacy pruned installation lacking
+complete seals, requires an explicit network and path, takes the one-writer
+directory lock, and invokes the existing journaled `recover-stalled-fork`
+implementation. It leaves the wallet untouched and preserves the old chain
+files under a recovery backup. The restarted daemon must independently
+resynchronize the blockchain; no deleted historical block bodies are
+fabricated or implicitly considered verified.
+
+This is a destructive **chain-state** reset, not a trust-preserving in-place
+seal migration. The untouched 1.1.2 fixture, benchmark and runtime tests
+remain **open** until executed successfully and reviewed by the maintainer.
