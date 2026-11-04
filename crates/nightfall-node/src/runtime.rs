@@ -108,9 +108,9 @@ impl Workers {
             };
 
             for handle in finished {
-                handle.join().map_err(|_| {
-                    anyhow::anyhow!("node worker panicked during shutdown")
-                })?;
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("node worker panicked during shutdown"))?;
             }
             if outstanding == 0 {
                 return Ok(());
