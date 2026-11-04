@@ -72,9 +72,9 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
         .unwrap()
         .as_secs();
     let base = now.saturating_sub(9_000);
-    let shared_miner = WalletKeys::from_seed([0x41; 32]).address();
-    let light_miner = WalletKeys::from_seed([0x42; 32]).address();
-    let heavy_miner = WalletKeys::from_seed([0x43; 32]).address();
+    let shared_miner = WalletKeys::generate().address();
+    let light_miner = WalletKeys::generate().address();
+    let heavy_miner = WalletKeys::generate().address();
 
     // Difficulty adjusts over the 90-block LWMA window. Fast branch B
     // eventually has strictly more work despite having fewer blocks.
@@ -85,10 +85,9 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
             .unwrap();
     }
 
-    let mut a_long_light = Chain::new_fair(NetworkId::Devnet).unwrap();
-    let mut b_short_heavy = Chain::new_fair(NetworkId::Devnet).unwrap();
-    a_long_light.try_ingest_blocks(prefix.blocks.clone(), now).unwrap();
-    b_short_heavy.try_ingest_blocks(prefix.blocks.clone(), now).unwrap();
+    // Clone the fully validated shared ancestor, not the genesis body twice.
+    let mut a_long_light = prefix.clone();
+    let mut b_short_heavy = prefix.clone();
 
     for i in 0..125u64 {
         a_long_light
