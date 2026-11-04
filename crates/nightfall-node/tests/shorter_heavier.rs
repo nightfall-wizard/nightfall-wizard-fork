@@ -43,7 +43,8 @@ fn boot(dir: &Path) -> (NodeHandle, u16) {
         peers_url: Some("off".to_owned()),
         introducer: false,
         prune: false,
-    }).expect("start isolated node");
+    })
+    .expect("start isolated node");
 
     wait_until("node TCP listener ready", Duration::from_secs(25), || {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p2p));
@@ -59,7 +60,8 @@ fn test_directory() -> PathBuf {
         .unwrap()
         .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "nf-shorter-heavier-{}-{unique}", std::process::id()
+        "nf-shorter-heavier-{}-{unique}",
+        std::process::id()
     ));
     fs::create_dir_all(&path).unwrap();
     path
@@ -72,16 +74,20 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
         .unwrap()
         .as_secs();
     let base = now.saturating_sub(9_000);
-    let shared_miner = WalletKeys::generate().address();
-    let light_miner = WalletKeys::generate().address();
-    let heavy_miner = WalletKeys::generate().address();
+    let shared_miner = WalletKeys::from_seed([0x41; 32]).address();
+    let light_miner = WalletKeys::from_seed([0x42; 32]).address();
+    let heavy_miner = WalletKeys::from_seed([0x43; 32]).address();
 
     // Difficulty adjusts over the 90-block LWMA window. Fast branch B
     // eventually has strictly more work despite having fewer blocks.
     let mut prefix = Chain::new_fair(NetworkId::Devnet).unwrap();
     for i in 0..2 {
         prefix
-            .mine_block(&shared_miner, vec![], base + 10 + i * TARGET_BLOCK_TIME_SECS)
+            .mine_block(
+                &shared_miner,
+                vec![],
+                base + 10 + i * TARGET_BLOCK_TIME_SECS,
+            )
             .unwrap();
     }
 
@@ -109,7 +115,8 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
     assert!(
         b_short_heavy.total_work > a_long_light.total_work,
         "B must be strictly heavier despite being shorter: B={}, A={}",
-        b_short_heavy.total_work, a_long_light.total_work
+        b_short_heavy.total_work,
+        a_long_light.total_work
     );
 
     let a_tip = a_long_light.tip_hash().to_hex();
@@ -135,22 +142,26 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
     // No peer is configured until both branches are verified on disk.
     a.add_peer(&format!("127.0.0.1:{b_port}")).unwrap();
 
-    wait_until("A adopts B shorter/heavier chain", Duration::from_secs(120), || {
-        let sa = a.status_snapshot().unwrap();
-        let sb = b.status_snapshot().unwrap();
-        !sa.loading
-            && !sb.loading
-            && sa.tip == b_tip
-            && sb.tip == b_tip
-            && sa.total_work == b_work
-            && sb.total_work == b_work
-            && sa.utxo_root == b_root
-            && sb.utxo_root == b_root
-            && sa.supply_ok
-            && sb.supply_ok
-            && !sa.reorg_in_flight
-            && !sb.reorg_in_flight
-    });
+    wait_until(
+        "A adopts B shorter/heavier chain",
+        Duration::from_secs(120),
+        || {
+            let sa = a.status_snapshot().unwrap();
+            let sb = b.status_snapshot().unwrap();
+            !sa.loading
+                && !sb.loading
+                && sa.tip == b_tip
+                && sb.tip == b_tip
+                && sa.total_work == b_work
+                && sb.total_work == b_work
+                && sa.utxo_root == b_root
+                && sb.utxo_root == b_root
+                && sa.supply_ok
+                && sb.supply_ok
+                && !sa.reorg_in_flight
+                && !sb.reorg_in_flight
+        },
+    );
 
     // B must not switch onto A's longer but lighter chain.
     let sa = a.status_snapshot().unwrap();
