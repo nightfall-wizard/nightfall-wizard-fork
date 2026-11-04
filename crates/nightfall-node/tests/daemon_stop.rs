@@ -58,14 +58,12 @@ fn start_daemon(dir: &Path) -> Child {
 }
 
 fn signal_and_stop(child: &mut Child) {
-    assert!(
-        Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .status()
-            .expect("send SIGTERM")
-            .success()
-    );
+    assert!(Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGTERM")
+        .success());
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -84,7 +82,10 @@ fn signal_and_stop(child: &mut Child) {
 
 #[test]
 fn sigterm_clean_shutdown_then_restart_preserves_datadir() {
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!(
         "nightfall-daemon-restart-{}-{stamp}",
         std::process::id()
@@ -97,7 +98,9 @@ fn sigterm_clean_shutdown_then_restart_preserves_datadir() {
     let chain = ChainStore::new(&dir)
         .load_or_new(NetworkId::Devnet)
         .expect("reload chain after SIGTERM");
-    chain.verify_supply().expect("supply invariant after clean stop");
+    chain
+        .verify_supply()
+        .expect("supply invariant after clean stop");
     let tip = chain.tip_hash();
     drop(chain);
 
@@ -107,7 +110,9 @@ fn sigterm_clean_shutdown_then_restart_preserves_datadir() {
     let loaded = ChainStore::new(&dir)
         .load_or_new(NetworkId::Devnet)
         .expect("reload chain after second shutdown");
-    loaded.verify_supply().expect("supply invariant after restart");
+    loaded
+        .verify_supply()
+        .expect("supply invariant after restart");
     assert_eq!(loaded.tip_hash(), tip, "restart altered the canonical tip");
 
     fs::remove_dir_all(dir).expect("cleanup test datadir");
