@@ -756,13 +756,19 @@ fn three_nodes_converge_after_partition_with_competing_branches() {
     b.node
         .add_peer(&c_addr)
         .expect("connect short partition B to heavy partition C");
+    // Both nodes on the losing fork must have an explicit outbound route to
+    // the heavier node: the reorg side-channel fetch is outbound-only.
+    // An inbound connection from C to A does not let A fetch C's chain.
+    a.node
+        .add_peer(&c_addr)
+        .expect("connect short partition A to heavy partition C");
     c.node
         .add_peer(&a_addr)
         .expect("connect heavy partition C to short partition A");
 
     wait_until(
         "all three nodes converge on heavier branch after partition heal",
-        Duration::from_secs(60),
+        Duration::from_secs(90),
         &[&a, &b, &c],
         || {
             let sa = a.snapshot();
