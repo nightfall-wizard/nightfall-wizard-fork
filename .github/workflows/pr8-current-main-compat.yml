@@ -1,0 +1,26 @@
+name: PR8 current-main multi-node compatibility
+on:
+  push:
+    branches:
+      - wip/pr8-current-main-compat-20261104
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Real three-node and peer suppression acceptance x3
+        run: |
+          set -eu
+          for n in 1 2 3; do
+            echo "real multi-node run $n"
+            cargo test --locked -p nightfall-node --test multinode -- --test-threads=1
+          done
+      - name: Current upstream P2P framing regressions
+        run: cargo test --locked -p nightfall-p2p --test request_blocks_adversarial
