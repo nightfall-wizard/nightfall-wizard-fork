@@ -915,7 +915,7 @@ impl NodeHandle {
         }
     }
 
-    pub fn shutdown(self) -> anyhow::Result<()> {
+    pub fn shutdown(&self) -> anyhow::Result<()> {
         self.request_shutdown();
 
         // No new registered worker may appear after this barrier.
