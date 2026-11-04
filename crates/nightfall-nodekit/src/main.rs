@@ -15,7 +15,7 @@ use std::time::Duration;
 #[command(
     name = "nightfall-nodekit",
     version,
-    about = "Diagnose, verify and set up a NIGHTFALLCOIN node — read-only unless you name an output file"
+    about = "Diagnose, verify and set up a NIGHTFALLCOIN node; destructive legacy upgrades require explicit --force"
 )]
 struct Cli {
     /// Network to check against. Its genesis is computed by this build's
