@@ -211,6 +211,96 @@ python3 -m unittest discover \
 tail -n 8 "$REPORT/policy-tests.log"
 
 STEP=rust-mainnet
+python3 - <<'DIAGPY'
+from pathlib import Path
+
+p = Path(
+    'src/crates/nightfall-storage/tests/'
+    'pr100_real_checkpoint_acceptance.rs'
+)
+
+s = p.read_text(encoding='utf-8')
+
+helper_marker = 'struct Cleanup(PathBuf);'
+
+helper = '''
+fn measure_json<T: serde::Serialize>(value: &T) -> usize {
+    struct Count(usize);
+
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(b.len());
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut count = Count(0);
+
+    serde_json::to_writer(
+        &mut count,
+        value
+    ).unwrap();
+
+    count.0
+}
+'''
+
+assert s.count(helper_marker) == 1
+
+s = s.replace(
+    helper_marker,
+    helper + '\n' + helper_marker,
+    1
+)
+
+counts_marker = '    drop(snapshot);'
+
+counts = '''
+    eprintln!(
+        "PR100_DIAG_COMPONENTS headers_count={} recent_bodies_count={} utxos_count={} headers_json_bytes={} recent_bodies_json_bytes={} utxos_json_bytes={}",
+        snapshot.headers.len(),
+        snapshot.recent_bodies.len(),
+        snapshot.utxos.len(),
+        measure_json(&snapshot.headers),
+        measure_json(&snapshot.recent_bodies),
+        measure_json(&snapshot.utxos),
+    );
+'''
+
+assert s.count(counts_marker) == 1
+
+s = s.replace(
+    counts_marker,
+    counts + '\n' + counts_marker,
+    1
+)
+
+assert_marker = (
+    '    assert!(\n'
+    '        snapshot_bytes > 0 && '
+    'snapshot_bytes <= 512 * 1024 * 1024,'
+)
+
+assert s.count(assert_marker) == 1
+
+s = s.replace(
+    assert_marker,
+    '    eprintln!("PR100_DIAG_SNAPSHOT_SIZE bytes={} cap_bytes=536870912", snapshot_bytes);\n'
+    + assert_marker,
+    1
+)
+
+p.write_text(s, encoding='utf-8')
+
+print(
+    'Temporärer Runner-Test instrumentiert; '
+    'Importgrenze unveraendert.'
+)
+DIAGPY
 
 export NF_PR100_ARCHIVE_COPY="$ARCHIVE"
 
