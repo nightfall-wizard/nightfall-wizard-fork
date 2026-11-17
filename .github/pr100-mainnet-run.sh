@@ -76,7 +76,7 @@ passed = (
 )
 
 state = (
-    'PASS_LIMITED'
+    'EXPERIMENTAL_PASS'
     if passed
     else (
         'BLOCKED'
@@ -211,6 +211,15 @@ python3 -m unittest discover \
 tail -n 8 "$REPORT/policy-tests.log"
 
 STEP=rust-mainnet
+python3 .github/pr100-compact-v3-patch.py
+(
+  cd src
+  cargo test --release --locked -p nightfall-storage --lib checkpoint_snapshot_carries_authentic_unspent_outputs -- --nocapture
+) > "$REPORT/compact-unit-tests.log" 2>&1 || {
+  tail -n 120 "$REPORT/compact-unit-tests.log"
+  exit 3
+}
+tail -n 15 "$REPORT/compact-unit-tests.log"
 python3 - <<'DIAGPY'
 from pathlib import Path
 
@@ -464,4 +473,4 @@ AFTER_SHA=YES
 
 STEP=completed
 
-printf 'PASS_LIMITED: verified offline real Mainnet equivalence on exact PR commit.\n'
+printf 'EXPERIMENTAL_PASS: modified v3 prototype on disposable runner, not original PR code.\n'
