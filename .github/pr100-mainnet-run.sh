@@ -269,6 +269,89 @@ counts = '''
         measure_json(&snapshot.recent_bodies),
         measure_json(&snapshot.utxos),
     );
+
+    let binary_total =
+        bincode::serialized_size(&snapshot).unwrap();
+
+    let binary_headers =
+        bincode::serialized_size(&snapshot.headers).unwrap();
+
+    let binary_bodies =
+        bincode::serialized_size(&snapshot.recent_bodies).unwrap();
+
+    let binary_utxos =
+        bincode::serialized_size(&snapshot.utxos).unwrap();
+
+    let metadata_bytes: u64 = snapshot.utxos.iter().map(|u|
+        bincode::serialized_size(
+            &(&u.commit, &u.output_pk, u.height)
+        ).unwrap()
+    ).sum();
+
+    let minimal_dedup_estimate = binary_total
+        .saturating_sub(binary_utxos)
+        .saturating_add(metadata_bytes + 8);
+
+    eprintln!(
+        "PR100_DIAG_BINARY total_bytes={} headers_bytes={} bodies_bytes={} utxos_bytes={} utxo_metadata_bytes={} dedup_estimated_bytes={}",
+        binary_total,
+        binary_headers,
+        binary_bodies,
+        binary_utxos,
+        metadata_bytes,
+        minimal_dedup_estimate,
+    );
+
+    let binary_file =
+        scratch.join("checkpoint-diagnostic-bincode.bin");
+
+    {
+        let writer = std::io::BufWriter::new(
+            std::fs::File::create(&binary_file).unwrap()
+        );
+
+        bincode::serialize_into(
+            writer,
+            &snapshot
+        ).unwrap();
+    }
+
+    let binary_disk_bytes =
+        std::fs::metadata(&binary_file).unwrap().len();
+
+    assert_eq!(binary_disk_bytes, binary_total);
+
+    let gzip_file =
+        scratch.join("checkpoint-diagnostic-bincode.gz");
+
+    let gzip_result = std::process::Command::new("gzip")
+        .arg("-1")
+        .arg("-c")
+        .arg(&binary_file)
+        .stdout(std::process::Stdio::from(
+            std::fs::File::create(&gzip_file).unwrap()
+        ))
+        .status();
+
+    if let Ok(status) = gzip_result {
+        if status.success() {
+            let gz =
+                std::fs::metadata(&gzip_file).unwrap().len();
+
+            eprintln!(
+                "PR100_DIAG_BINARY_GZIP bytes={}",
+                gz
+            );
+        } else {
+            eprintln!(
+                "PR100_DIAG_BINARY_GZIP unavailable_status"
+            );
+        }
+    } else {
+        eprintln!(
+            "PR100_DIAG_BINARY_GZIP unavailable_command"
+        );
+    }
 '''
 
 assert s.count(counts_marker) == 1
