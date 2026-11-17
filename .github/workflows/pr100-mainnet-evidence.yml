@@ -1,4 +1,4 @@
-name: PR100 isolated Mainnet evidence
+name: PR100 compact v3 security regressions
 
 on:
   push:
@@ -36,20 +36,20 @@ jobs:
       - name: Stable Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Execute real Mainnet acceptance
+      - name: Execute complete compact v3 regression suite
         id: acceptance
         continue-on-error: true
-        run: bash .github/pr100-mainnet-run.sh
+        run: bash .github/pr100-v3-regressions.sh
 
       - name: Upload raw evidence and receipt
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr100-mainnet-evidence
+          name: pr100-v3-regressions
           path: evidence/
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Reject incomplete or unsuccessful acceptance
+      - name: Reject incomplete or unsuccessful regressions
         if: always()
         run: test "${{ steps.acceptance.outcome }}" = success
