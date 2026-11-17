@@ -1,0 +1,55 @@
+name: PR100 isolated Mainnet evidence
+
+on:
+  push:
+    branches:
+      - 'pr100-evidence-*'
+
+permissions:
+  contents: read
+
+jobs:
+  mainnet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '8'
+
+    steps:
+      - name: Checkout isolated harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact PR100 source commit
+        uses: actions/checkout@v4
+        with:
+          repository: nightfall-wizard/nightfall-wizard-fork
+          ref: 42a99a0a940cfdb277f3f951a35bb4f6795d6ada
+          path: src
+          persist-credentials: false
+
+      - name: Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Execute real Mainnet acceptance
+        id: acceptance
+        continue-on-error: true
+        run: bash .github/pr100-mainnet-run.sh
+
+      - name: Upload raw evidence and receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr100-mainnet-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Reject incomplete or unsuccessful acceptance
+        if: always()
+        run: test "${{ steps.acceptance.outcome }}" = success
