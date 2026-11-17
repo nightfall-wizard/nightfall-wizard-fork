@@ -1,0 +1,42 @@
+name: PR100 pinned rustfmt patch
+
+on:
+  push:
+    branches:
+      - 'pr100-fmt-*'
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: nightfall-wizard/nightfall-wizard-fork
+          ref: 739b0163b0db6caec672a0bb0aca60fda668dfaf
+          path: source
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Generate restricted formatting patch
+        run: bash .github/create-format-patch.sh
+
+      - name: Archive exact formatting patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr100-rustfmt
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
