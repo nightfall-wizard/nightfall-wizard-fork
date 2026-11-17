@@ -76,7 +76,7 @@ passed = (
 )
 
 state = (
-    'EXPERIMENTAL_PASS'
+    'EXPERIMENTAL_PASS_HARDENED'
     if passed
     else (
         'BLOCKED'
@@ -212,9 +212,16 @@ tail -n 8 "$REPORT/policy-tests.log"
 
 STEP=rust-mainnet
 python3 .github/pr100-compact-v3-patch.py
+python3 .github/pr100-v3-hardening.py
+# Exact bytes to be promoted, before test-only instrumentation.
+sha256sum \
+  src/crates/nightfall-storage/src/checkpoint.rs \
+  src/crates/nightfall-storage/src/lib.rs \
+  src/crates/nightfall-storage/tests/pr100_real_checkpoint_acceptance.rs \
+  > "$REPORT/patched-source.sha256"
 (
   cd src
-  cargo test --release --locked -p nightfall-storage --lib checkpoint_snapshot_carries_authentic_unspent_outputs -- --nocapture
+  cargo test --release --locked -p nightfall-storage --lib -- --nocapture
 ) > "$REPORT/compact-unit-tests.log" 2>&1 || {
   tail -n 120 "$REPORT/compact-unit-tests.log"
   exit 3
@@ -473,4 +480,4 @@ AFTER_SHA=YES
 
 STEP=completed
 
-printf 'EXPERIMENTAL_PASS: modified v3 prototype on disposable runner, not original PR code.\n'
+printf 'EXPERIMENTAL_PASS_HARDENED: modified v3 prototype on disposable runner, not original PR code.\n'
