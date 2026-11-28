@@ -50,7 +50,7 @@ pub struct Manifest {
     pub archive: String,
     pub archive_bytes: u64,
     pub blocks_bin_sha256: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_checkpoint")]
     pub checkpoint: Option<CheckpointAsset>,
 }
 
@@ -60,6 +60,25 @@ pub struct CheckpointAsset {
     pub file: String,
     pub bytes: u64,
     pub sha256: String,
+}
+
+// A malformed optional optimization must not disable the independently
+// checked full archive. Only the checkpoint downloader may use this field,
+// and it checks the descriptor before constructing a URL.
+fn deserialize_optional_checkpoint<'de, D>(
+    deserializer: D,
+) -> Result<Option<CheckpointAsset>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match serde_json::from_value(value) {
+        Ok(asset) => Some(asset),
+        Err(error) => {
+            tracing::warn!("ignoring malformed optional checkpoint descriptor: {error}");
+            None
+        }
+    }))
 }
 
 impl CheckpointAsset {
@@ -150,9 +169,8 @@ impl Manifest {
         if !(MIN_ARCHIVE_BYTES..=MAX_ARCHIVE_BYTES).contains(&self.archive_bytes) {
             anyhow::bail!("the archive description states an implausible size");
         }
-        if let Some(checkpoint) = &self.checkpoint {
-            checkpoint.check()?;
-        }
+        // The optional snapshot is validated by download_checkpoint, not
+        // here: a rejected snapshot must leave the archive path available.
         Ok(())
     }
 
@@ -664,14 +682,67 @@ mod tests {
         });
 
         manifest.check(GENESIS).unwrap();
+        manifest.checkpoint.as_ref().unwrap().check().unwrap();
 
         manifest.checkpoint.as_mut().unwrap().file = "../../wallet.seed".into();
-        assert!(manifest.check(GENESIS).is_err());
+        assert!(manifest.checkpoint.as_ref().unwrap().check().is_err());
+        assert!(manifest.check(GENESIS).is_ok());
 
         manifest.checkpoint.as_mut().unwrap().file =
             "nightfall-checkpoint-505000-2026-11-18.bin".into();
         manifest.checkpoint.as_mut().unwrap().bytes = 512 * 1024 * 1024 + 1;
 
+        assert!(manifest.checkpoint.as_ref().unwrap().check().is_err());
+        assert!(manifest.check(GENESIS).is_ok());
+
+        manifest.checkpoint.as_mut().unwrap().bytes = 400_548_128;
+        manifest.checkpoint.as_mut().unwrap().sha256 = "invalid".into();
+        assert!(manifest.checkpoint.as_ref().unwrap().check().is_err());
+        assert!(manifest.check(GENESIS).is_ok());
+    }
+
+    #[test]
+    fn malformed_optional_checkpoint_preserves_archive_but_not_invalid_base_manifest() {
+        let mut value = serde_json::json!({
+            "network": "mainnet",
+            "height": 505591,
+            "tip": "00".repeat(32),
+            "genesis": GENESIS,
+            "archive": "nightfall-chain-505591-2026-11-12.bin",
+            "archive_bytes": MIN_ARCHIVE_BYTES,
+            "blocks_bin_sha256": "00".repeat(32)
+        });
+
+        for checkpoint in [
+            serde_json::Value::Null,
+            serde_json::json!("not a descriptor"),
+            serde_json::json!({"height": 505000}),
+            serde_json::json!({
+                "height": "505000",
+                "file": "nightfall-checkpoint-505000-2026-11-18.bin",
+                "bytes": 400548128,
+                "sha256": "00".repeat(32)
+            }),
+        ] {
+            value["checkpoint"] = checkpoint;
+            let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+            assert!(manifest.checkpoint.is_none());
+            manifest.check(GENESIS).unwrap();
+        }
+
+        value["checkpoint"] = serde_json::json!({
+            "height": 505000,
+            "file": "nightfall-checkpoint-505000-2026-11-18.bin",
+            "bytes": 400548128,
+            "sha256": "00".repeat(32)
+        });
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        manifest.checkpoint.as_ref().unwrap().check().unwrap();
+        manifest.check(GENESIS).unwrap();
+
+        value["checkpoint"] = serde_json::json!("malformed");
+        value["archive"] = serde_json::json!("../../wallet.seed");
+        let manifest: Manifest = serde_json::from_value(value).unwrap();
         assert!(manifest.check(GENESIS).is_err());
     }
 
