@@ -4525,11 +4525,17 @@ pub static GPU_MINING: AtomicBool = AtomicBool::new(false);
 pub static GPU_BATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether this binary was built with the GPU backend at all.
-pub const GPU_AVAILABLE: bool = cfg!(feature = "gpu");
+pub const GPU_AVAILABLE: bool = cfg!(all(
+    feature = "gpu",
+    any(target_os = "macos", windows, target_os = "linux")
+));
 
 /// Nonces per GPU dispatch. 128 × 32 MiB = 4 GiB; measured on an M3 Pro this
 /// is where the rate stops climbing (~1,770 H/s). `NF_GPU_BATCH` overrides.
-#[cfg(feature = "gpu")]
+#[cfg(all(
+    feature = "gpu",
+    any(target_os = "macos", windows, target_os = "linux")
+))]
 fn gpu_batch() -> usize {
     std::env::var("NF_GPU_BATCH")
         .ok()
@@ -4545,7 +4551,10 @@ fn gpu_batch() -> usize {
 /// recomputed with the consensus hasher, and a mismatch is an error that
 /// switches the GPU off, so a driver or kernel fault can at worst waste time,
 /// never put an invalid block on the network.
-#[cfg(feature = "gpu")]
+#[cfg(all(
+    feature = "gpu",
+    any(target_os = "macos", windows, target_os = "linux")
+))]
 fn mine_gpu(
     slot: &mut Option<nightfall_gpu::GpuHasher>,
     preimage: &[u8],
@@ -4623,7 +4632,10 @@ fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
         );
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(all(
+        feature = "gpu",
+        any(target_os = "macos", windows, target_os = "linux")
+    ))]
     let mut gpu_slot: Option<nightfall_gpu::GpuHasher> = None;
 
     loop {
@@ -4772,7 +4784,10 @@ fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
         // GPU first when switched on (local build only). Measured on an M3 Pro,
         // CPU threads alongside the GPU *lower* the total — both fight over the
         // same memory bandwidth — so the GPU replaces them rather than joining.
-        #[cfg(feature = "gpu")]
+        #[cfg(all(
+            feature = "gpu",
+            any(target_os = "macos", windows, target_os = "linux")
+        ))]
         let gpu_result = if GPU_MINING.load(Ordering::Relaxed) {
             match mine_gpu(
                 &mut gpu_slot,
@@ -4796,7 +4811,10 @@ fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
             gpu_slot = None;
             None
         };
-        #[cfg(not(feature = "gpu"))]
+        #[cfg(not(all(
+            feature = "gpu",
+            any(target_os = "macos", windows, target_os = "linux")
+        )))]
         let gpu_result: Option<Option<(u64, nightfall_types::Hash256)>> = None;
 
         let found = match gpu_result {
