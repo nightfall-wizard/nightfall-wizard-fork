@@ -24,9 +24,13 @@ jobs:
       BASE_SHA: "7af27fc1f8f4145611a1f96ecd428dfe94811351"
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/pr100-target
 
     steps:
+      - name: Configure Cargo target directory
+        shell: bash
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/pr100-target" >> "$GITHUB_ENV"
+
       - name: Checkout exact PR head
         uses: actions/checkout@v4
         with:
@@ -97,7 +101,7 @@ jobs:
           import json, re, sys, shutil
           from pathlib import Path
           m = json.loads(Path(sys.argv[1]).read_text())
-          assert m["network"] == "mainnet"
+          assert m["network"].lower() == "mainnet"
           assert m["genesis"].lower() == (
               "061a052d49607ff8f4b306c75d622ebd"
               "230cff4ec3a45a6dffc2f7738d4b20de"
@@ -278,7 +282,7 @@ jobs:
           source = json.loads(
               (evidence / "source-manifest.json").read_text()
           )
-          assert m["network"] == "mainnet"
+          assert m["network"].lower() == "mainnet"
           assert m["genesis"].lower() == source["genesis"].lower()
           assert m["tip"].lower() == source["tip"].lower()
           assert m["height"] == source["height"]
